@@ -9,8 +9,8 @@ paths:
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  backbone: "Qwen/Qwen2.5-VL-7B-Instruct"
-  hidden_size: 3584           # Qwen2.5-VL-7B hidden dim (also STATE_DIM / SKILL_DIM)
+  backbone: "Qwen/Qwen2.5-7B-Instruct"
+  hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
   lora:
     r: 16
     lora_alpha: 32

@@ -30,7 +30,7 @@ class StateConditionalEncoder(nn.Module):
 
     def __init__(
         self,
-        state_dim: int,     # e.g. 3584 for Qwen2.5-VL-7B
+        state_dim: int,     # e.g. 3584 for Qwen2.5-7B
         skill_dim: int,     # same as state_dim (same embedding source)
         latent_dim: int,    # z_tilde dimension, e.g. 64
         hidden_dim: int = 512,

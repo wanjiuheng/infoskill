@@ -1,7 +1,7 @@
 """
 skill_library/skill_updater.py
 
-Slow Module — SkillUpdater: use the local Qwen2.5-VL model to summarise
+Slow Module — SkillUpdater: use the local Qwen2.5-7B-Instruct model to summarise
 successful trajectories into new Skill candidates.
 
 Called by InfoskillTrainer every T global steps when episode_reward ≥ threshold.

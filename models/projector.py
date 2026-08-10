@@ -29,7 +29,7 @@ class Projector(nn.Module):
         self,
         latent_dim: int,         # z_tilde dimension, e.g. 64
         num_prefix: int,         # m, number of soft prefix tokens, e.g. 8
-        llm_hidden_size: int,    # Qwen2.5-VL-7B: 3584
+        llm_hidden_size: int,    # Qwen2.5-7B: 3584
     ) -> None:
         super().__init__()
         self.num_prefix     = num_prefix

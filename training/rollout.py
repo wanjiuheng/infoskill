@@ -83,7 +83,7 @@ class GroupRolloutCollector:
 
     Args:
         envs:        List of G AlfworldTextEnv instances (same task, diff seeds).
-        model:       Qwen2.5-VL model with LoRA (on device).
+        model:       Qwen2.5-7B-Instruct model with LoRA (on device).
         tokenizer:   Matching tokenizer.
         encoder:     StateConditionalEncoder.
         projector:   Projector.

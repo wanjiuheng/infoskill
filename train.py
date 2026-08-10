@@ -8,7 +8,7 @@ Usage:
 
 The script:
   1. Loads config from YAML.
-  2. Loads Qwen2.5-VL-7B-Instruct with LoRA applied.
+  2. Loads Qwen2.5-7B-Instruct with LoRA applied.
   3. Instantiates all Fast Module components + SkillLibrary + SkillUpdater.
   4. Creates env factories for train and eval.
   5. Builds a single AdamW optimiser over all trainable params.
@@ -67,8 +67,8 @@ def set_seed(seed: int) -> None:
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def build_model_and_tokenizer(cfg: dict, device: torch.device):
-    """Load Qwen2.5-VL, freeze backbone, apply LoRA."""
-    from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
+    """Load Qwen2.5-7B-Instruct (text-only), freeze backbone, apply LoRA."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = cfg["model"]["backbone"]
     logger.info("Loading backbone: %s", model_name)
@@ -77,7 +77,7 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",

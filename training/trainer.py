@@ -49,7 +49,7 @@ class InfoskillTrainer:
     Orchestrates Fast + Slow modules and the GRPO training loop.
 
     Args:
-        model:        Qwen2.5-VL with LoRA applied (main policy / BRAIN).
+        model:        Qwen2.5-7B-Instruct with LoRA applied (main policy / BRAIN).
         tokenizer:    Matching tokenizer.
         encoder:      StateConditionalEncoder.
         prior_net:    PriorNetwork.

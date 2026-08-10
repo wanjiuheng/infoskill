@@ -6,7 +6,7 @@ token-embedding layer (frozen) + mean pooling.
 
 Decision: use the backbone's get_input_embeddings() with mean pooling over
 tokens. No separate embedding model needed; hidden_size = 3584 for
-Qwen2.5-VL-7B-Instruct.
+Qwen2.5-7B-Instruct.
 """
 
 import torch

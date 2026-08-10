@@ -57,7 +57,7 @@ ALFWorld 原有的低层执行控制器（TextWorld 引擎），接收高层文�
 _Avoid_: 底层控制器、executor
 
 **BRAIN**:
-原 ALFWorld seq2seq 策略网络的替代品，即 Qwen2.5-VL-7B-Instruct（主干冻结 + LoRA 微调）。通过接收 Soft Prefix + tokenized 文本 obs 生成动作文本。
+原 ALFWorld seq2seq 策略网络的替代品，即 Qwen2.5-7B-Instruct（纯文本，主干冻结 + LoRA 微调）。通过接收 Soft Prefix + tokenized 文本 obs 生成动作文本。ALFWorld 使用 `AlfredTWEnv` 文字模式，环境本身不产生图像（符号状态经模板 NLG 直接转文字），因此 BRAIN 不需要视觉能力。
 _Avoid_: LLM agent、policy model（在设计层用 BRAIN，在代码层用 llm/model）
 
 **Active Mask**:
