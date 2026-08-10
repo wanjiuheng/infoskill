@@ -153,20 +153,38 @@ def build_fast_modules(cfg: dict, device: torch.device):
 
 # ── Env factories ─────────────────────────────────────────────────────────────
 
+def _resolve_env_class(config_path: str):
+    """
+    Pick AlfworldTextEnv or AlfredThorTextEnv by reading `env.type` out of the
+    referenced ALFWorld config yaml (envs/alfworld_base_config.yaml uses
+    AlfredTWEnv, envs/alfworld_thor_config.yaml uses AlfredThorEnv). This lets
+    configs/alfworld.yaml and configs/alfworld_thor.yaml stay interchangeable
+    from the trainer's point of view -- only paths.alfworld_config differs.
+    """
+    with open(config_path, encoding="utf-8") as f:
+        alfworld_cfg = yaml.safe_load(f)
+    env_type = alfworld_cfg.get("env", {}).get("type", "AlfredTWEnv")
+
+    if env_type == "AlfredThorEnv":
+        from envs.alfworld_thor_env import AlfredThorTextEnv
+        return AlfredThorTextEnv
+    from envs.alfworld_env import AlfworldTextEnv
+    return AlfworldTextEnv
+
+
 def make_train_env_factory(cfg: dict):
     """
-    Returns a factory(seed) → List[G AlfworldTextEnv].
+    Returns a factory(seed) → List[G env wrappers].
     All G envs share the same config_path but use consecutive seeds.
     """
-    from envs.alfworld_env import AlfworldTextEnv
-
     config_path = cfg["paths"]["alfworld_config"]
+    env_cls     = _resolve_env_class(config_path)
     G           = cfg["rollout"]["group_size"]
     max_steps   = cfg["rollout"]["max_steps"]
 
     def factory(seed: int):
         return [
-            AlfworldTextEnv(
+            env_cls(
                 config_path=config_path,
                 train_eval="train",
                 seed=seed + i,
@@ -178,14 +196,13 @@ def make_train_env_factory(cfg: dict):
 
 
 def make_eval_env_factory(cfg: dict):
-    """Returns a factory() → single AlfworldTextEnv for eval."""
-    from envs.alfworld_env import AlfworldTextEnv
-
+    """Returns a factory() → single env wrapper for eval."""
     config_path = cfg["paths"]["alfworld_config"]
+    env_cls     = _resolve_env_class(config_path)
     max_steps   = cfg["rollout"]["max_steps"]
 
     def factory():
-        return AlfworldTextEnv(
+        return env_cls(
             config_path=config_path,
             train_eval="eval_in_distribution",
             seed=0,

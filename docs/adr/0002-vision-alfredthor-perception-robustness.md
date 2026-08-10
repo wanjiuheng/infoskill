@@ -38,7 +38,7 @@
 
 ### 已知风险 / 待验证项
 
-1. **ai2thor 无头渲染**：H100/H20 服务器大概率无显示器，需要配置 `Xvfb`（如 `xvfb-run`）才能启动 ai2thor 渲染；本机 Windows 开发环境很可能跑不通，需要在 Linux GPU 服务器上验证。
+1. **ai2thor 无头渲染**：确认实验环境为 H100/H20 Linux GPU 服务器，用 `xvfb-run` 起虚拟显示是 ai2thor 官方支持的标准无头渲染方案，风险较低；仍需在实际服务器上跑一次最小化验证（`Xvfb` 是否已装、ai2thor 版本与驱动是否兼容）。之前担心的 Windows 本机兼容性问题不适用，无需处理。
 2. **检测器权重下载**：需要 `alfworld-download` 拉取 `detectors/mrcnn.pth`。
 3. **与 SkillRL 的可比性**：若想让方案二也有一个公平 baseline，需要用户自行在 `AlfredThorEnv` 下重跑一遍 SkillRL（不能直接抄它论文里 `AlfredTWEnv` 模式的数字）。
 4. **Rollout 速度**：真实物理仿真 + 实时 Mask-RCNN 推理远慢于模板文字生成，G 个并行 env 的 wall-clock 开销会明显上升，可能需要视情况缩小 `group_size` 或 `num_episodes`。

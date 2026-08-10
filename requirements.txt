@@ -12,3 +12,13 @@ numpy
 # ALFWorld environment (text mode: AlfredTWEnv)
 alfworld
 textworld[pddl]>=1.6.1
+
+# ALFWorld vision mode (AlfredThorEnv + mrcnn_astar controller, option2 branch only).
+# Mirrors alfworld-master/requirements-full.txt. Requires a headless display on the
+# Linux training machine, e.g. `xvfb-run` (see docs/adr/0002-*.md).
+ai2thor==2.1.0
+opencv-python
+torchvision
+pycocotools
+h5py
+werkzeug==2.0.3

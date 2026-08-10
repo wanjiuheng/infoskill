@@ -1,0 +1,85 @@
+# InfoSkill — ALFWorld AlfredThorEnv config (Option 2: perception-robustness experiment)
+#
+# Adapted from alfworld-master/configs/eval_config.yaml.
+# Key differences vs. envs/alfworld_base_config.yaml (Option 1 / AlfredTWEnv):
+#   - env.type: 'AlfredThorEnv'      (real ai2thor rendering, not TextWorld templates)
+#   - controller.type: 'mrcnn_astar' (BUTLER::VISION = pretrained Mask-RCNN + A* nav)
+#   - env.thor / mask_rcnn sections added
+#
+# Requires (on the Linux training machine):
+#   - ai2thor installed and runnable headless (xvfb-run), see docs/adr/0002-*.md
+#   - $ALFWORLD_DATA/detectors/mrcnn.pth downloaded via `alfworld-download`
+
+dataset:
+  data_path: '$ALFWORLD_DATA/json_2.1.1/train'
+  eval_id_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_seen'
+  eval_ood_data_path: '$ALFWORLD_DATA/json_2.1.1/valid_unseen'
+  num_train_games: -1
+  num_eval_games: -1
+
+logic:
+  domain: '$ALFWORLD_DATA/logic/alfred.pddl'
+  grammar: '$ALFWORLD_DATA/logic/alfred.twl2'
+
+env:
+  type: 'AlfredThorEnv'
+  domain_randomization: False
+  task_types: [1, 2, 3, 4, 5, 6]
+  expert_timeout_steps: 150
+  expert_type: "handcoded"
+  goal_desc_human_anns_prob: 0.0
+
+  thor:
+    screen_width: 300
+    screen_height: 300
+    smooth_nav: False              # keep False: smooth nav is much slower, no benefit for our text-only BRAIN
+    save_frames_to_disk: False
+    save_frames_path: './videos/'
+
+controller:
+  type: 'mrcnn_astar'              # BUTLER::VISION (Mask-RCNN) + BUTLER::BODY (A* teleport nav)
+  debug: False
+  load_receps: True
+
+mask_rcnn:
+  pretrained_model_path: '$ALFWORLD_DATA/detectors/mrcnn.pth'
+
+general:
+  random_seed: 42
+  use_cuda: True
+  visdom: False
+  task: 'alfred'
+  training_method: 'dagger'
+  save_path: './training/'
+  observation_pool_capacity: 3
+  hide_init_receptacles: False
+  training:
+    batch_size: 1
+    max_episode: 50000
+  evaluate:
+    run_eval: False
+    batch_size: 1
+    env:
+      type: "AlfredThorEnv"
+
+dagger:
+  action_space: "generation"
+  max_target_length: 20
+  beam_width: 1
+  generate_top_k: 1
+  training:
+    max_nb_steps_per_episode: 50
+  fraction_assist:
+    fraction_assist_anneal_episodes: 50000
+    fraction_assist_anneal_from: 1.0
+    fraction_assist_anneal_to: 0.01
+  fraction_random:
+    fraction_random_anneal_episodes: 0
+    fraction_random_anneal_from: 0.0
+    fraction_random_anneal_to: 0.0
+  replay:
+    replay_memory_capacity: 500000
+    update_per_k_game_steps: 5
+    replay_batch_size: 64
+    replay_sample_history_length: 4
+    replay_sample_update_from: 2
