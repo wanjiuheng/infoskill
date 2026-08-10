@@ -33,9 +33,13 @@ loss:
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
-  group_size: 2          # 原来是 8，先降到 2 节省显存/时间
-  max_steps: 10          # 原来是 50
-  max_new_tokens: 128         # LLM generation budget per step
+  group_size: 1          # 原来是 8，先降到 1 —— 每次 backward 前要同时留住这么多份
+                         # 带梯度的 forward 计算图，是当前 OOM 的真正原因（不是
+                         # 单纯的显存分配技巧问题），先降到最小跑通 debug 流程，
+                         # 后续需要重构 rollout/update 的耦合方式才能真正支持
+                         # group_size=8 的正式训练规模
+  max_steps: 2           # 原来是 50/10 —— 同理，每多一步就多留一份计算图
+  max_new_tokens: 32          # LLM generation budget per step
   temperature: 0.9
   top_p: 0.9
   history_len: 3              # how many past (obs, action) pairs to include in prompt
