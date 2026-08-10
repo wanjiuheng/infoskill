@@ -102,6 +102,16 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device):
     model.print_trainable_parameters()
     model = model.to(device)
 
+    # Trade compute for memory: without this, the full-sequence forward pass in
+    # rollout._compute_log_probs() (needed to get a differentiable log-prob for
+    # the policy loss) keeps every layer's activations alive for backward and
+    # OOMs on a 7B model even at batch size 2. enable_input_require_grads() is
+    # required alongside it — with a frozen base model + inputs_embeds (not
+    # input_ids), gradient checkpointing otherwise can't recompute activations
+    # on the backward pass because the checkpointed input doesn't require grad.
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+
     return model, tokenizer
 
 
