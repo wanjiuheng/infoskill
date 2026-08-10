@@ -345,6 +345,11 @@ class GroupRolloutCollector:
         input_embeds = embed_layer(enc.input_ids)         # [G, seq_len, H]
 
         # Prepend soft prefix: [soft_prefix | input_embeds]
+        # soft_prefix comes from the (float32) Projector while input_embeds is
+        # whatever dtype the backbone uses (bfloat16) — cast to match, or
+        # torch.cat silently upcasts the whole tensor to float32 and every
+        # downstream Linear layer (bfloat16 weights) errors out.
+        soft_prefix = soft_prefix.to(input_embeds.dtype)
         inputs_embeds = torch.cat([soft_prefix, input_embeds], dim=1)  # [G, m+seq, H]
 
         # Extend attention mask to cover the prefix tokens (all 1s)
