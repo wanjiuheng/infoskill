@@ -106,7 +106,7 @@ class AlfworldTextEnv(BaseEnvWrapper):
         obs_list, infos = self._env.reset()
         self._step_count = 0
 
-        obs_text: str = obs_list[0] if isinstance(obs_list, list) else obs_list
+        obs_text: str = obs_list[0] if isinstance(obs_list, (list, tuple)) else obs_list
 
         # Extract task description from the first observation or infos
         # ALFWorld prepends "Your task is to: ..." in the first obs
@@ -136,7 +136,7 @@ class AlfworldTextEnv(BaseEnvWrapper):
         self._step_count += 1
 
         obs_list, scores, dones_list, infos = self._env.step([action])
-        obs_text: str = obs_list[0] if isinstance(obs_list, list) else obs_list
+        obs_text: str = obs_list[0] if isinstance(obs_list, (list, tuple)) else obs_list
         won: bool = bool(infos.get("won", [False])[0])
         done: bool = bool(dones_list[0]) or (self._step_count >= self._max_steps)
 
