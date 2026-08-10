@@ -1,8 +1,13 @@
 # InfoSkill dependencies
-# NOTE: install a torch build matching your CUDA version separately if this
-# generic wheel doesn't pick up GPU support, e.g.:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch>=2.1.0
+# NOTE: torch is intentionally NOT listed here — install it separately BEFORE
+# `pip install -r requirements.txt`, with a CUDA build matching your driver
+# (H100/H20 driver here supports up to CUDA 12.4). Requires Python 3.10/3.11
+# (torch>=2.9 dropped cu124-tagged wheels and switched to an unlabeled "wheel
+# variant" scheme; on Python >=3.12 there is no cu124-compatible torch build).
+# PyPI's own torch==2.6.0 wheel is already a cu124 build, so no pytorch.org
+# index is needed (useful if download.pytorch.org is unreachable):
+#   conda create -n infoskill python=3.11 -y && conda activate infoskill
+#   pip install torch==2.6.0
 transformers>=4.43.0        # Qwen2.5-7B-Instruct (text-only) support
 accelerate>=0.30.0
 peft>=0.11.0

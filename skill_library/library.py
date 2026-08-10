@@ -36,10 +36,18 @@ class Skill:
     __slots__ = ("skill_id", "title", "principle", "when_to_apply", "category")
 
     def __init__(self, d: Dict, category: str = "general"):
-        self.skill_id    = d.get("skill_id", str(uuid.uuid4())[:8])
-        self.title       = d["title"]
-        self.principle   = d["principle"]
-        self.when_to_apply = d.get("when_to_apply", "")
+        self.skill_id    = d.get("skill_id", d.get("mistake_id", str(uuid.uuid4())[:8]))
+        if "title" not in d and "description" in d:
+            # common_mistakes schema: mistake_id/description/why_it_happens/how_to_avoid
+            # (no title/principle keys) — map onto the same title/principle fields
+            # so grounding_text / format_for_prompt / save() need no special-casing.
+            self.title       = f"Avoid: {d.get('description', '')}"
+            self.principle   = d.get("how_to_avoid", "")
+            self.when_to_apply = d.get("why_it_happens", "")
+        else:
+            self.title       = d["title"]
+            self.principle   = d["principle"]
+            self.when_to_apply = d.get("when_to_apply", "")
         self.category    = category   # 'general' | task-type name | 'mistake'
 
     @property

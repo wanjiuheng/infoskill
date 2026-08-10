@@ -216,7 +216,18 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
 def main():
     args   = parse_args()
     cfg    = load_config(args.config)
-    device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
+    wanted_device = cfg.get("device", "cuda")
+    if wanted_device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Config requests device=%r but torch.cuda.is_available() is False "
+            "(no CUDA GPU visible to torch). This usually means the installed "
+            "torch wheel's CUDA build is newer than what the NVIDIA driver "
+            "supports — check `nvidia-smi` (driver's max CUDA version) against "
+            "`python -c \"import torch; print(torch.version.cuda)\"` (torch's "
+            "CUDA build) and reinstall a matching torch wheel. To force CPU "
+            "anyway, set device: cpu in the config." % wanted_device
+        )
+    device = torch.device(wanted_device)
     set_seed(cfg.get("seed", 42))
 
     logger.info("Device: %s", device)
