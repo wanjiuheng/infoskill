@@ -1,0 +1,69 @@
+# InfoSkill ALFWorld Configuration
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+paths:
+  alfworld_config: "envs/alfworld_base_config.yaml"   # AlfredTWEnv config
+  skills_json: "skill_library/data/claude_style_skills.json"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+model:
+  backbone: "Qwen/Qwen2.5-VL-7B-Instruct"
+  hidden_size: 3584           # Qwen2.5-VL-7B hidden dim (also STATE_DIM / SKILL_DIM)
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+
+# ── Fast Module (Encoder / Projector / Predictors) ────────────────────────────
+fast:
+  latent_dim: 64              # z_tilde dimension
+  num_prefix: 8               # m: number of soft prefix tokens
+  grounding_hidden_dim: 512   # GroundingDecoder LSTM hidden size
+  grounding_max_len: 64       # max tokens for grounding target (title + principle)
+
+# ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
+loss:
+  alpha1: 0.1                 # weight for (fidelity + beta*rate)
+  alpha2: 0.01                # weight for grounding loss
+  beta: 0.001                 # compression strength: higher = more aggressive compression
+
+# ── GRPO / Rollout ────────────────────────────────────────────────────────────
+rollout:
+  group_size: 8               # G: parallel episodes per task
+  max_steps: 50               # max steps per episode
+  max_new_tokens: 128         # LLM generation budget per step
+  temperature: 0.9
+  top_p: 0.9
+  history_len: 3              # how many past (obs, action) pairs to include in prompt
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  num_episodes: 5000          # total episodes (outer loop)
+  learning_rate: 1e-4
+  grad_clip: 1.0
+  batch_accumulation: 1
+
+  # Slow module
+  slow_update_interval: 200   # T: steps between library maintenance runs
+  success_threshold: 0.8      # episode reward threshold to trigger skill generation
+  mig_beta: 0.001             # beta used in MIG = Fidelity - beta*Rate for pruning
+
+  # Checkpointing
+  save_freq: 100              # save checkpoint every N episodes
+  eval_freq: 50               # run eval every N episodes
+  eval_episodes: 64           # episodes for evaluation run
+
+# ── Skill Library ─────────────────────────────────────────────────────────────
+skill_library:
+  top_k_general: 3            # number of general skills to retrieve per step
+  top_k_task: 3               # number of task-specific skills to retrieve per step
+  max_skills: 200             # hard cap on library size
+  skill_gen_batch: 5          # trajectories fed to Qwen per skill-generation call
+
+# ── Device ────────────────────────────────────────────────────────────────────
+device: "cuda"
+seed: 42

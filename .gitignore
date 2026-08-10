@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# checkpoints / logs / outputs
+checkpoints/
+logs/
+outputs/
+runs/
+*.pt
+*.ckpt
+
+# local env
+.env
