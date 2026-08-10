@@ -4,12 +4,12 @@
 paths:
   alfworld_config: "envs/alfworld_base_config.yaml"   # AlfredTWEnv config
   skills_json: "skill_library/data/claude_style_skills.json"
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
+  checkpoint_dir: "checkpoints_debug"
+  log_dir: "logs_debug"
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  backbone: "Qwen/Qwen2.5-7B-Instruct"
+  backbone: "/root/workspaces/models/Qwen2.5-7B-Instruct"
   hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
   lora:
     r: 16
@@ -33,8 +33,8 @@ loss:
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
-  group_size: 8               # G: parallel episodes per task
-  max_steps: 50               # max steps per episode
+  group_size: 2          # 原来是 8，先降到 2 节省显存/时间
+  max_steps: 10          # 原来是 50
   max_new_tokens: 128         # LLM generation budget per step
   temperature: 0.9
   top_p: 0.9
@@ -42,20 +42,19 @@ rollout:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  num_episodes: 5000          # total episodes (outer loop)
-  learning_rate: 1.0e-4        # NOTE: PyYAML parses "1e-4" (no decimal point) as a
-                                # string, not a float — always write "1.0e-4" style.
+  num_episodes: 5        # 原来是 5000，只跑 5 个 episode
+  learning_rate: 1.0e-4
   grad_clip: 1.0
   batch_accumulation: 1
 
   # Slow module
-  slow_update_interval: 200   # T: steps between library maintenance runs
+  slow_update_interval: 3   # T: steps between library maintenance runs
   success_threshold: 0.8      # episode reward threshold to trigger skill generation
   mig_beta: 0.001             # beta used in MIG = Fidelity - beta*Rate for pruning
 
   # Checkpointing
-  save_freq: 100              # save checkpoint every N episodes
-  eval_freq: 50               # run eval every N episodes
+  save_freq: 5              # save checkpoint every N episodes
+  eval_freq: 1000        # 先关掉/推后 eval，避免第一次就多跑一套 eval 流程
   eval_episodes: 64           # episodes for evaluation run
 
 # ── Skill Library ─────────────────────────────────────────────────────────────

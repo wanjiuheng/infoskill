@@ -207,7 +207,7 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
     for m in modules:
         params.extend(m.parameters())
 
-    lr = cfg["training"].get("learning_rate", 1e-4)
+    lr = float(cfg["training"].get("learning_rate", 1e-4))
     return torch.optim.AdamW(params, lr=lr)
 
 
