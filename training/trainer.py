@@ -168,7 +168,7 @@ class InfoskillTrainer:
 
             self._episode_count += self.G
             group_idx += 1
-            step_count = sum(1 for r in buf.records if not (r.done and r.ep_idx >= 0 and r.log_prob.item() == 0.0))
+            step_count = sum(1 for r in buf.records if not r.is_padding)
             self._global_step += step_count
 
             # ── Logging ───────────────────────────────────────────────────────
