@@ -23,12 +23,14 @@ from __future__ import annotations
 import os
 import json
 import logging
+import time
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from training.rollout import GroupRolloutCollector, TrajectoryBuffer, StepRecord
 from training.grpo import compute_grpo_advantages
@@ -140,6 +142,17 @@ class InfoskillTrainer:
         logger.info("InfoskillTrainer: starting training for %d episodes.", self.num_episodes)
 
         group_idx = 0
+        start_time = time.time()
+
+        # 创建进度条
+        pbar = tqdm(
+            total=self.num_episodes,
+            desc="Training",
+            unit="ep",
+            ncols=100,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+
         while self._episode_count < self.num_episodes:
             # ── Create G envs for this group (same task family, different seeds)
             seed = group_idx * self.G
@@ -182,6 +195,19 @@ class InfoskillTrainer:
                 len(self.skill_lib),
             )
 
+            # 更新进度条
+            pbar.update(self.G)
+            elapsed = time.time() - start_time
+            avg_time_per_ep = elapsed / self._episode_count if self._episode_count > 0 else 0
+            remaining_eps = self.num_episodes - self._episode_count
+            eta_seconds = avg_time_per_ep * remaining_eps
+            pbar.set_postfix({
+                "sr": f"{sr:.2f}",
+                "loss": f"{loss_dict['total']:.4f}",
+                "skills": len(self.skill_lib),
+                "ETA": f"{eta_seconds/3600:.1f}h" if eta_seconds >= 3600 else f"{eta_seconds/60:.0f}m"
+            })
+
             # Accumulate pending success trajectories
             self._pending_traj.extend(buf.success_trajectories)
 
@@ -199,6 +225,7 @@ class InfoskillTrainer:
                 run_eval(self, eval_env_factory, n_episodes=self.cfg["training"]["eval_episodes"])
 
         logger.info("Training complete after %d episodes.", self._episode_count)
+        pbar.close()
         self.save_checkpoint(final=True)
 
     # ── Fast Module update ────────────────────────────────────────────────────
