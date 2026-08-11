@@ -203,77 +203,143 @@ class InfoskillTrainer:
     # ── Fast Module update ────────────────────────────────────────────────────
 
     def _fast_update(self, buf: TrajectoryBuffer) -> Dict[str, float]:
-        """Compute GRPO advantages, build tensors, compute + backprop total loss."""
+        """
+        Fast Module 更新：mini-batch recomputation 版本。
 
-        # 1. GRPO advantages: one scalar per episode → broadcast to its steps
+        对比旧版（单次 backward）：
+          旧版：rollout 时计算所有 log_prob（带梯度），内存 ∝ G × max_steps
+          新版：rollout 时无梯度，update 阶段分批重算 log_prob，内存 ∝ mini_batch_size
+
+        Args:
+            buf: TrajectoryBuffer from GroupRolloutCollector.collect()
+
+        Returns:
+            loss_dict: {"total", "policy", "fidelity", "rate", "grounding"}
+        """
+
+        # 1. 计算 GRPO advantages（每个 episode 一个标量）
         advantages_per_ep = compute_grpo_advantages(buf.total_rewards)  # [G]
 
-        # 2. Filter to active (non-zero-masked) records
+        # 2. 过滤出有效的 records（排除 padding placeholders）
         active_records: List[StepRecord] = [
-            r for r in buf.records
-            if not (r.done and r.log_prob.item() == 0.0 and r.action == "")
+            r for r in buf.records if not r.is_padding
         ]
         if not active_records:
-            return {"total": 0.0, "policy": 0.0, "fidelity": 0.0, "rate": 0.0, "grounding": 0.0}
+            return {
+                "total": 0.0, "policy": 0.0, "fidelity": 0.0,
+                "rate": 0.0, "grounding": 0.0
+            }
 
-        # 3. Stack tensors
-        z_list      = [r.z_tilde   for r in active_records]
-        mu_list     = [r.mu        for r in active_records]
-        lv_list     = [r.log_var   for r in active_records]
-        s_list      = [r.state_emb for r in active_records]
-        lp_list     = [r.log_prob  for r in active_records]
-        adv_list    = [advantages_per_ep[r.ep_idx] for r in active_records]
+        N = len(active_records)
 
-        z_tilde     = torch.stack(z_list,   dim=0).to(self.device)  # [N, L]
-        mu          = torch.stack(mu_list,  dim=0).to(self.device)
-        log_var     = torch.stack(lv_list,  dim=0).to(self.device)
-        state_embs  = torch.stack(s_list,   dim=0).to(self.device)  # [N, D]
-        log_probs   = torch.stack(lp_list,  dim=0).to(self.device)  # [N]
-        advantages  = torch.tensor(adv_list, device=self.device, dtype=torch.float32)
+        # 3. Prepare advantage tensor broadcast to each step
+        adv_list = [advantages_per_ep[r.ep_idx] for r in active_records]
+        advantages = torch.tensor(adv_list, device=self.device, dtype=torch.float32)  # [N]
 
-        # 4. Prior
-        prior_mu, prior_logvar = self.prior_net(state_embs)
+        # 4. Mini-batch recomputation loop
+        #    这里的 batch_size 是每次 forward + backward 的 step 数量。
+        #    可以根据显存调整；默认 16 是保守值，足够小以避免 OOM，
+        #    又不至于让 backward 调用次数过多（过多会稍微增加通信开销）。
+        batch_size = 16
+        self.optimizer.zero_grad()  # 清空梯度，准备累加
 
-        # 5. RewardPredictor
-        pred_advantage = self.reward_predictor(z_tilde, state_embs)
+        # 累积各项 loss 用于日志（从每个 mini-batch 收集）
+        total_loss_accum = 0.0
+        p_loss_accum = 0.0
+        f_loss_accum = 0.0
+        r_loss_accum = 0.0
+        g_loss_accum = 0.0
+        num_batches = 0
 
-        # 6. Grounding loss — use one batch of active records (capped for speed)
-        grounding_loss = self._compute_grounding_loss(active_records)
+        for i in range(0, N, batch_size):
+            batch_records = active_records[i : i + batch_size]
+            batch_adv = advantages[i : i + batch_size]  # [B]
+            B = len(batch_records)
 
-        # 7. Total loss
-        total, p_loss, f_loss, r_loss, g_loss = compute_total_loss(
-            log_probs=log_probs,
-            advantages=advantages,
-            pred_advantage=pred_advantage,
-            mu=mu,
-            log_var=log_var,
-            prior_mu=prior_mu,
-            prior_log_var=prior_logvar,
-            grounding_loss=grounding_loss,
-            alpha1=self.alpha1,
-            alpha2=self.alpha2,
-            beta=self.beta,
-        )
+            # ── 4a. 重新计算 encoder forward（带梯度）──────────────────────────
+            state_embs_b = torch.stack(
+                [r.state_emb for r in batch_records], dim=0
+            ).to(self.device)  # [B, D]
+            skill_embs_b = torch.stack(
+                [r.skill_emb for r in batch_records], dim=0
+            ).to(self.device)  # [B, D]
 
-        # 8. Backprop
-        self.optimizer.zero_grad()
-        total.backward()
+            mu_new, log_var_new = self.encoder(state_embs_b, skill_embs_b)  # [B, L]
+
+            # ── 4b. 用存储的 eps 重构 z_tilde（带梯度）────────────────────────
+            eps_b = torch.stack(
+                [r.eps for r in batch_records], dim=0
+            ).to(self.device)  # [B, L]
+            std_new = torch.exp(0.5 * log_var_new)
+            z_tilde_new = mu_new + std_new * eps_b  # [B, L], 梯度连接到 encoder
+
+            # ── 4c. projector → soft_prefix（带梯度）──────────────────────────
+            soft_prefix_b = self.projector(z_tilde_new)  # [B, m, H]
+
+            # ── 4d. 重新计算 log_prob（带梯度）────────────────────────────────
+            #    对每个 record，用存储的 prompt_ids 和 gen_ids 重建完整序列，
+            #    前向 LLM，计算生成 token 的 log-prob。
+            log_probs_b = self._recompute_log_probs_batch(
+                batch_records, soft_prefix_b
+            )  # [B]
+
+            # ── 4e. 计算 prior、reward predictor、grounding loss ──────────────
+            prior_mu_b, prior_logvar_b = self.prior_net(state_embs_b)  # [B, L]
+            pred_advantage_b = self.reward_predictor(z_tilde_new, state_embs_b)  # [B]
+
+            # Grounding loss：只在第一个 mini-batch 计算（避免重复计算，
+            # 因为 grounding 是辅助loss，不需要每个 batch 都算）
+            if i == 0:
+                grounding_loss_scalar = self._compute_grounding_loss(batch_records)
+            else:
+                grounding_loss_scalar = torch.tensor(0.0, device=self.device)
+
+            # ── 4f. 计算 total loss（这个 mini-batch）───────────────────────
+            total_b, p_b, f_b, r_b, g_b = compute_total_loss(
+                log_probs=log_probs_b,
+                advantages=batch_adv,
+                pred_advantage=pred_advantage_b,
+                mu=mu_new,
+                log_var=log_var_new,
+                prior_mu=prior_mu_b,
+                prior_log_var=prior_logvar_b,
+                grounding_loss=grounding_loss_scalar,
+                alpha1=self.alpha1,
+                alpha2=self.alpha2,
+                beta=self.beta,
+                mask=None,  # 已经过滤掉 padding，不需要 mask
+            )
+
+            # ── 4g. Backward（梯度累加）────────────────────────────────────────
+            # 注意：不调用 optimizer.zero_grad()，这样梯度会累加到之前的 mini-batch
+            total_b.backward()
+
+            # 累积 loss 用于日志（按 batch size 加权平均）
+            total_loss_accum += total_b.item() * B
+            p_loss_accum += p_b.item() * B
+            f_loss_accum += f_b.item() * B
+            r_loss_accum += r_b.item() * B
+            g_loss_accum += (g_b.item() if isinstance(g_b, torch.Tensor) else g_b) * B
+            num_batches += B
+
+        # 5. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）
         nn.utils.clip_grad_norm_(self._all_params(), self.grad_clip)
         self.optimizer.step()
 
-        # 9. Update usage history for Slow Module
+        # 6. 更新 usage history（用于 Slow Module MIG 计算）
         with torch.no_grad():
             for rec, adv in zip(active_records, adv_list):
                 self._usage_history[rec.skill_text[:50]].append(
                     (rec.state_emb.cpu(), float(adv))
                 )
 
+        # 7. 返回平均 loss（用于日志）
         return {
-            "total":    total.item(),
-            "policy":   p_loss.item(),
-            "fidelity": f_loss.item(),
-            "rate":     r_loss.item(),
-            "grounding": g_loss.item() if isinstance(g_loss, torch.Tensor) else g_loss,
+            "total": total_loss_accum / num_batches,
+            "policy": p_loss_accum / num_batches,
+            "fidelity": f_loss_accum / num_batches,
+            "rate": r_loss_accum / num_batches,
+            "grounding": g_loss_accum / num_batches,
         }
 
     def _compute_grounding_loss(self, records: List[StepRecord]) -> torch.Tensor:
@@ -298,6 +364,132 @@ class InfoskillTrainer:
         ).to(self.device)
 
         return self.grounding_decoder(z_batch, s_batch, target_ids=enc.input_ids)
+
+    def _recompute_log_probs_batch(
+        self,
+        batch_records: List[StepRecord],
+        soft_prefix: torch.Tensor,  # [B, m, H], already with gradient
+    ) -> torch.Tensor:
+        """
+        对一个 mini-batch 的 records，重新计算每个 step 的 log_prob（带梯度）。
+
+        流程：
+          1. 用存储的 prompt_ids embed 成 prompt_embeds
+          2. 拼接 [soft_prefix | prompt_embeds]
+          3. 用存储的 gen_ids embed 成 gen_embeds
+          4. 拼接 [soft_prefix | prompt_embeds | gen_embeds]，得到完整序列
+          5. 前向 LLM，得到 logits
+          6. 提取生成部分的 token log-probs，计算 mean
+
+        Args:
+            batch_records: List of StepRecord (length B)
+            soft_prefix:   [B, m, H] tensor with gradient attached
+
+        Returns:
+            log_probs: [B] tensor, mean log-prob per step
+        """
+        B = len(batch_records)
+        device = self.device
+
+        # 1. Tokenize prompt_ids → embed
+        #    每个 record 的 prompt_ids 长度可能不同（已去除 padding），
+        #    需要重新 pad 成统一长度以便 batch forward。
+        prompt_ids_list = [r.prompt_ids.to(device) for r in batch_records]
+        max_prompt_len = max(t.size(0) for t in prompt_ids_list)
+
+        # Pad prompt_ids to max_prompt_len (left-padding with pad_token_id)
+        pad_id = self.tokenizer.pad_token_id
+        prompt_ids_padded = []
+        prompt_mask = []
+        for t in prompt_ids_list:
+            pad_len = max_prompt_len - t.size(0)
+            if pad_len > 0:
+                t_padded = torch.cat([
+                    torch.full((pad_len,), pad_id, dtype=torch.long, device=device),
+                    t
+                ], dim=0)
+                mask = torch.cat([
+                    torch.zeros(pad_len, dtype=torch.long, device=device),
+                    torch.ones(t.size(0), dtype=torch.long, device=device)
+                ], dim=0)
+            else:
+                t_padded = t
+                mask = torch.ones(t.size(0), dtype=torch.long, device=device)
+            prompt_ids_padded.append(t_padded)
+            prompt_mask.append(mask)
+
+        prompt_ids_batch = torch.stack(prompt_ids_padded, dim=0)  # [B, max_prompt_len]
+        prompt_mask_batch = torch.stack(prompt_mask, dim=0)       # [B, max_prompt_len]
+
+        embed_layer = self.model.get_input_embeddings()
+        prompt_embeds = embed_layer(prompt_ids_batch)  # [B, max_prompt_len, H]
+
+        # 2. 拼接 soft_prefix
+        soft_prefix = soft_prefix.to(prompt_embeds.dtype)  # dtype match
+        inputs_embeds = torch.cat([soft_prefix, prompt_embeds], dim=1)  # [B, m+max_prompt_len, H]
+
+        # Attention mask for prefix + prompt
+        m = soft_prefix.size(1)
+        prefix_mask = torch.ones(B, m, dtype=torch.long, device=device)
+        attn_mask = torch.cat([prefix_mask, prompt_mask_batch], dim=1)  # [B, m+max_prompt_len]
+
+        # 3. Embed gen_ids
+        gen_ids_list = [r.gen_ids.to(device) for r in batch_records]
+        # gen_ids 在同一个 rollout step 内长度是一致的（generate() 产出统一长度）
+        # 但保险起见还是检查并 pad
+        max_gen_len = max(t.size(0) for t in gen_ids_list)
+        gen_ids_padded = []
+        gen_mask = []
+        for t in gen_ids_list:
+            pad_len = max_gen_len - t.size(0)
+            if pad_len > 0:
+                t_padded = torch.cat([
+                    t,
+                    torch.full((pad_len,), pad_id, dtype=torch.long, device=device)
+                ], dim=0)
+                mask = torch.cat([
+                    torch.ones(t.size(0), dtype=torch.long, device=device),
+                    torch.zeros(pad_len, dtype=torch.long, device=device)
+                ], dim=0)
+            else:
+                t_padded = t
+                mask = torch.ones(t.size(0), dtype=torch.long, device=device)
+            gen_ids_padded.append(t_padded)
+            gen_mask.append(mask)
+
+        gen_ids_batch = torch.stack(gen_ids_padded, dim=0)  # [B, max_gen_len]
+        gen_mask_batch = torch.stack(gen_mask, dim=0)       # [B, max_gen_len]
+
+        gen_embeds = embed_layer(gen_ids_batch)  # [B, max_gen_len, H]
+
+        # 4. 拼接完整序列
+        full_embeds = torch.cat([inputs_embeds, gen_embeds], dim=1)  # [B, m+max_prompt_len+max_gen_len, H]
+        full_mask = torch.cat([attn_mask, gen_mask_batch], dim=1)    # [B, m+max_prompt_len+max_gen_len]
+
+        # 5. Forward LLM
+        logits = self.model(
+            inputs_embeds=full_embeds,
+            attention_mask=full_mask,
+        ).logits  # [B, m+max_prompt_len+max_gen_len, V]
+
+        # 6. 计算生成部分的 log-prob
+        #    生成部分在序列的最后 max_gen_len 个位置
+        #    logit[t] 预测 token[t+1]，所以生成 token 的 logit 位置是
+        #    [m+max_prompt_len-1 : m+max_prompt_len+max_gen_len-1]
+        start = m + max_prompt_len - 1
+        gen_logits = logits[:, start : start + max_gen_len, :]  # [B, max_gen_len, V]
+
+        log_prob_all = F.log_softmax(gen_logits, dim=-1)  # [B, max_gen_len, V]
+        tok_log_probs = log_prob_all.gather(
+            dim=-1, index=gen_ids_batch.unsqueeze(-1)
+        ).squeeze(-1)  # [B, max_gen_len]
+
+        # Mean over valid (non-padding) generated tokens
+        gen_valid_mask = gen_mask_batch.float()  # [B, max_gen_len]
+        n_valid = gen_valid_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        mean_log_probs = (tok_log_probs * gen_valid_mask).sum(dim=-1) / n_valid  # [B]
+
+        return mean_log_probs
 
     # ── Slow Module update ────────────────────────────────────────────────────
 
