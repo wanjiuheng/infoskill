@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from training.rollout import GroupRolloutCollector, TrajectoryBuffer, StepRecord
 from training.grpo import compute_grpo_advantages
