@@ -20,6 +20,7 @@ Slow loop  (every T global steps):
 
 from __future__ import annotations
 
+import csv
 import os
 import json
 import logging
@@ -124,6 +125,10 @@ class InfoskillTrainer:
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
+        # Metrics tracking for loss curve plots
+        self._log_dir = cfg.get("paths", {}).get("log_dir", "logs")
+        self._metrics_history: List[Dict] = []
+
     # ── Main training loop ────────────────────────────────────────────────────
 
     def train(
@@ -195,6 +200,19 @@ class InfoskillTrainer:
                 len(self.skill_lib),
             )
 
+            # 记录 metrics 用于画图
+            self._metrics_history.append({
+                "episode": self._episode_count,
+                "group": group_idx,
+                "success_rate": sr,
+                "total_loss": loss_dict["total"],
+                "policy_loss": loss_dict["policy"],
+                "fidelity_loss": loss_dict["fidelity"],
+                "rate_loss": loss_dict["rate"],
+                "grounding_loss": loss_dict["grounding"],
+                "num_skills": len(self.skill_lib),
+            })
+
             # 更新进度条
             pbar.update(self.G)
             elapsed = time.time() - start_time
@@ -214,6 +232,9 @@ class InfoskillTrainer:
             # ── Slow Module ───────────────────────────────────────────────────
             if self._global_step % self.slow_interval == 0 and self._global_step > 0:
                 self._slow_update()
+
+            # ── Save metrics plot (每个 group 后更新) ──────────────────────────
+            self._save_metrics_plot()
 
             # ── Checkpoint ────────────────────────────────────────────────────
             if self._episode_count % self.save_freq == 0:
@@ -646,3 +667,90 @@ class InfoskillTrainer:
         self._episode_count = state["episode_count"]
         self._global_step   = state["global_step"]
         logger.info("Loaded checkpoint from %s (episode %d)", path, self._episode_count)
+
+    def _save_metrics_plot(self) -> None:
+        """
+        保存训练指标曲线图和 CSV 文件。
+        每个 group 后调用，覆盖写 loss_curve.png 和追加写 metrics.csv。
+        """
+        if not self._metrics_history:
+            return
+
+        os.makedirs(self._log_dir, exist_ok=True)
+
+        # ── Save CSV (追加模式，第一次写表头) ────────────────────────────────
+        csv_path = os.path.join(self._log_dir, "metrics.csv")
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "episode", "group", "success_rate", "total_loss",
+                "policy_loss", "fidelity_loss", "rate_loss", "grounding_loss", "num_skills"
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            # 只写最后一条（当前 group 的 metrics）
+            writer.writerow(self._metrics_history[-1])
+
+        # ── Plot curves (覆盖写 PNG) ──────────────────────────────────────────
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # 无 GUI 后端
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib 未安装，跳过绘图（pip install matplotlib）")
+            return
+
+        episodes = [m["episode"] for m in self._metrics_history]
+        sr = [m["success_rate"] for m in self._metrics_history]
+        total = [m["total_loss"] for m in self._metrics_history]
+        p = [m["policy_loss"] for m in self._metrics_history]
+        f = [m["fidelity_loss"] for m in self._metrics_history]
+        r = [m["rate_loss"] for m in self._metrics_history]
+        g = [m["grounding_loss"] for m in self._metrics_history]
+        skills = [m["num_skills"] for m in self._metrics_history]
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        fig.suptitle(f"InfoSkill Training Metrics (ep {self._episode_count}/{self.num_episodes})", fontsize=14)
+
+        # Success rate
+        axes[0, 0].plot(episodes, sr, label="Success Rate", color="tab:green", linewidth=1.5)
+        axes[0, 0].set_xlabel("Episode")
+        axes[0, 0].set_ylabel("Success Rate")
+        axes[0, 0].set_title("Success Rate")
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].legend()
+
+        # Total loss
+        axes[0, 1].plot(episodes, total, label="Total Loss", color="tab:red", linewidth=1.5)
+        axes[0, 1].set_xlabel("Episode")
+        axes[0, 1].set_ylabel("Loss")
+        axes[0, 1].set_title("Total Loss")
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].legend()
+
+        # Loss components
+        axes[1, 0].plot(episodes, p, label="Policy", alpha=0.8, linewidth=1)
+        axes[1, 0].plot(episodes, f, label="Fidelity", alpha=0.8, linewidth=1)
+        axes[1, 0].plot(episodes, r, label="Rate", alpha=0.8, linewidth=1)
+        axes[1, 0].plot(episodes, g, label="Grounding", alpha=0.8, linewidth=1)
+        axes[1, 0].set_xlabel("Episode")
+        axes[1, 0].set_ylabel("Loss")
+        axes[1, 0].set_title("Loss Components")
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].legend()
+
+        # Skill library size
+        axes[1, 1].plot(episodes, skills, label="# Skills", color="tab:purple", linewidth=1.5)
+        axes[1, 1].set_xlabel("Episode")
+        axes[1, 1].set_ylabel("Count")
+        axes[1, 1].set_title("Skill Library Size")
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].legend()
+
+        plt.tight_layout()
+        plot_path = os.path.join(self._log_dir, "loss_curve.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close(fig)
+
