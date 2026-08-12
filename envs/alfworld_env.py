@@ -85,6 +85,14 @@ class AlfworldTextEnv(BaseEnvWrapper):
         self._env = base_env.init_env(batch_size=1)
         self._env.seed(self._seed)
 
+        # Monkey patch: 禁用 shuffle，改为顺序采样（临时方案，用于遍历全部 3553 个训练样本）
+        # 原始的 TextworldBatchGymEnv.seed() 会调用 np.random.shuffle(self.game_files)
+        # 我们替换成空操作，让 reset() 按 game_files 的原始顺序（文件系统字母序）逐个取游戏
+        def _no_shuffle_seed(seed_value):
+            """空操作版本的 seed()，跳过 shuffle 步骤。"""
+            pass
+        self._env.seed = _no_shuffle_seed
+
     def close(self) -> None:
         if self._env is not None:
             try:
