@@ -54,7 +54,8 @@ training:
   mig_beta: 0.001             # beta used in MIG = Fidelity - beta*Rate for pruning
 
   # Checkpointing
-  save_freq: 100              # save checkpoint every N episodes
+  save_freq: 200              # save checkpoint every N episodes (must be multiple of
+                                # rollout.group_size=8 or the modulo never hits 0)
   eval_freq: 40               # run eval every N episodes (must be a multiple of
                                 # rollout.group_size, or episode_count % eval_freq
                                 # never hits 0 and eval silently never runs)
