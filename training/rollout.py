@@ -87,6 +87,7 @@ class TrajectoryBuffer:
     task_type:    str              = "pick_and_place"
     task_description: str         = ""
     success_trajectories: List[Dict] = field(default_factory=list)  # for Slow Module
+    task_info_per_episode: List[Dict] = field(default_factory=list)  # 每个 episode 自己的 task 信息
 
 
 # ── Collector ─────────────────────────────────────────────────────────────────
@@ -157,8 +158,15 @@ class GroupRolloutCollector:
             obs_list.append(obs)
             info_list.append(info)
 
-        buf.task_description = info_list[0]["task_description"]
-        buf.task_type        = info_list[0]["task_type"]
+        buf.task_description = info_list[0]["task_description"]  # 保留兼容性（日志等）
+        buf.task_type        = info_list[0]["task_type"]          # 保留兼容性（日志等）
+        buf.task_info_per_episode = [
+            {
+                "task_description": info["task_description"],
+                "task_type": info["task_type"],
+            }
+            for info in info_list
+        ]
 
         # ── Step loop ─────────────────────────────────────────────────────────
         # Everything in this loop runs under no_grad: rollout never needs a
@@ -255,8 +263,8 @@ class GroupRolloutCollector:
         for i in range(self.G):
             if ep_rewards[i] >= 1.0:   # any reward ≥ 1 means at least partial success
                 buf.success_trajectories.append({
-                    "task": buf.task_description,
-                    "task_type": buf.task_type,
+                    "task": buf.task_info_per_episode[i]["task_description"],
+                    "task_type": buf.task_info_per_episode[i]["task_type"],
                     "steps": ep_steps_buf[i],
                 })
 

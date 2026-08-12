@@ -197,7 +197,7 @@ def make_train_env_factory(cfg: dict):
             AlfworldTextEnv(
                 config_path=config_path,
                 train_eval="train",
-                seed=seed + i,
+                seed=seed,  # 组内共享同一个 seed，确保抽到同一个任务（GRPO 理论要求）
                 max_steps=max_steps,
             )
             for i in range(G)
