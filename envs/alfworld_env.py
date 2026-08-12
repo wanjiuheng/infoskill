@@ -148,7 +148,12 @@ class AlfworldTextEnv(BaseEnvWrapper):
         won: bool = bool(infos.get("won", [False])[0])
         done: bool = bool(dones_list[0]) or (self._step_count >= self._max_steps)
 
-        reward: float = 10.0 if won else 0.0
+        # Reward shaping: 基础成功奖励 10.0，减去步数惩罚（每步 -0.1）
+        # 鼓励更短、更高效的轨迹；失败则 reward=0.0
+        if won:
+            reward = 10.0 - 0.1 * self._step_count
+        else:
+            reward = 0.0
 
         admissible: List[str] = self._get_admissible(infos)
         info = {

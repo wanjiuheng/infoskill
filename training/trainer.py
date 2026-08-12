@@ -190,7 +190,7 @@ class InfoskillTrainer:
             self._global_step += step_count
 
             # ── Logging ───────────────────────────────────────────────────────
-            sr = sum(1 for r in buf.total_rewards if r >= 10.0) / self.G
+            sr = sum(1 for r in buf.total_rewards if r >= 1.0) / self.G  # 任务完成率（不考虑步数）
             logger.info(
                 "Episode %d | group %d | success_rate=%.2f | "
                 "loss=%.4f p=%.4f f=%.4f r=%.4f g=%.4f | skills=%d",

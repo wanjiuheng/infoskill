@@ -260,8 +260,10 @@ class GroupRolloutCollector:
         buf.total_rewards = ep_rewards
 
         # Collect successful trajectories for Slow Module
+        # 训练早期：放宽到 ≤50 步成功都收集（reward ≥ 5.0）
+        # 后期可提高到 7.0（≤30 步）或 8.0（≤20 步）
         for i in range(self.G):
-            if ep_rewards[i] >= 1.0:   # any reward ≥ 1 means at least partial success
+            if ep_rewards[i] >= 5.0:
                 buf.success_trajectories.append({
                     "task": buf.task_info_per_episode[i]["task_description"],
                     "task_type": buf.task_info_per_episode[i]["task_type"],
