@@ -16,6 +16,7 @@ The script:
 """
 
 import argparse
+import datetime
 import logging
 import os
 import random
@@ -25,11 +26,28 @@ import torch
 import yaml
 from peft import LoraConfig, get_peft_model
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger("train")
+
+
+def setup_logging(log_dir: str) -> None:
+    """Log to both stdout and a timestamped file under log_dir."""
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(
+        log_dir, f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
+    )
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    logger.info("Logging to %s", log_path)
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -226,6 +244,8 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
 def main():
     args   = parse_args()
     cfg    = load_config(args.config)
+    setup_logging(cfg["paths"]["log_dir"])
+
     wanted_device = cfg.get("device", "cuda")
     if wanted_device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(

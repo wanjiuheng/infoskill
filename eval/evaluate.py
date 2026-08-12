@@ -112,7 +112,7 @@ def run_eval(
 
                 embed_layer  = model.get_input_embeddings()
                 input_embeds = embed_layer(enc.input_ids)           # [1, seq, H]
-                inputs_embeds = torch.cat([soft_prefix, input_embeds], dim=1)
+                inputs_embeds = torch.cat([soft_prefix.to(input_embeds.dtype), input_embeds], dim=1)
                 prefix_mask   = torch.ones(
                     1, soft_prefix.size(1),
                     dtype=enc.attention_mask.dtype, device=device

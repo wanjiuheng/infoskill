@@ -55,7 +55,9 @@ training:
 
   # Checkpointing
   save_freq: 100              # save checkpoint every N episodes
-  eval_freq: 50               # run eval every N episodes
+  eval_freq: 40               # run eval every N episodes (must be a multiple of
+                                # rollout.group_size, or episode_count % eval_freq
+                                # never hits 0 and eval silently never runs)
   eval_episodes: 64           # episodes for evaluation run
 
 # ── Skill Library ─────────────────────────────────────────────────────────────
