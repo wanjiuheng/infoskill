@@ -8,6 +8,7 @@ reports success rate per task type and overall.
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional
 
@@ -56,10 +57,12 @@ def run_eval(
     projector.eval()
 
     results: Dict[str, List[bool]] = defaultdict(list)
+    eval_start = time.time()
 
     with torch.no_grad():
         pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
         for ep_idx in pbar:
+            ep_start = time.time()
             env = env_factory()
             obs, info = env.reset()
             task_type = info["task_type"]
@@ -152,14 +155,20 @@ def run_eval(
             results[task_type].append(won)
             env.close()
 
-            # Per-episode log + progress bar update
+            ep_time = time.time() - ep_start
+            step_time = ep_time / max(steps, 1)
             so_far = sum(sum(v) for v in results.values())
             total_so_far = sum(len(v) for v in results.values())
             running_sr = so_far / total_so_far if total_so_far else 0.0
-            pbar.set_postfix(task=task_type[:12], won=won, steps=steps, sr=f"{running_sr:.2f}")
+            elapsed_total = time.time() - eval_start
+            eta = elapsed_total / total_so_far * (n_episodes - total_so_far) if total_so_far else 0.0
+
+            pbar.set_postfix(task=task_type[:12], won=won, steps=steps, sr=f"{running_sr:.2f}", s_ep=f"{ep_time:.1f}s")
             logger.info(
-                "ep=%d/%d  task_type=%-25s  won=%-5s  steps=%2d  running_sr=%.2f",
-                ep_idx + 1, n_episodes, task_type, won, steps, running_sr,
+                "ep=%d/%d  task_type=%-25s  won=%-5s  steps=%2d  "
+                "ep_time=%.1fs  step_time=%.1fs  running_sr=%.2f  elapsed=%.0fs  eta=%.0fs",
+                ep_idx + 1, n_episodes, task_type, won, steps,
+                ep_time, step_time, running_sr, elapsed_total, eta,
             )
 
     # Compute metrics
