@@ -161,12 +161,17 @@ def main():
     logger.info("Starting eval: %d episodes, checkpoint=%s", args.n_episodes, args.checkpoint)
     metrics = run_eval(trainer, eval_env_factory, n_episodes=args.n_episodes)
 
-    print("\n=== Eval Results ===")
-    print(f"Checkpoint : {args.checkpoint}  (episode {episode_count})")
+    lines = [
+        "\n=== Eval Results ===",
+        f"Checkpoint : {args.checkpoint}  (episode {episode_count})",
+    ]
     for k, v in sorted(metrics.items()):
         label = k.replace("success/", "")
-        print(f"  {label:<30s} {v:.4f}  ({v*100:.1f}%)")
-    print("===================\n")
+        lines.append(f"  {label:<30s} {v:.4f}  ({v*100:.1f}%)")
+    lines.append("===================\n")
+    result_str = "\n".join(lines)
+    print(result_str)
+    logger.info("Final results:\n%s", result_str)
 
 
 if __name__ == "__main__":
