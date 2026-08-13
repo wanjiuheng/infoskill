@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -22,10 +23,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import yaml
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+
+def setup_logging(log_path: str) -> None:
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=fmt)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter(fmt))
+    logging.getLogger().addHandler(fh)
+
+
 logger = logging.getLogger("eval_checkpoint")
 
 
@@ -39,7 +46,20 @@ def main():
     parser.add_argument("--config",      required=True,  help="Path to YAML config (e.g. configs/alfworld.yaml)")
     parser.add_argument("--checkpoint",  required=True,  help="Checkpoint directory (e.g. checkpoints/ep1000)")
     parser.add_argument("--n_episodes",  type=int, default=64, help="Number of eval episodes (default: 64)")
+    parser.add_argument("--log_file",    default=None, help="Path to log file (auto-generated if not set)")
     args = parser.parse_args()
+
+    # ── Logging setup ─────────────────────────────────────────────────────────
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    if args.log_file:
+        log_path = args.log_file
+    else:
+        ckpt_name = Path(args.checkpoint).name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = str(log_dir / f"eval_{ckpt_name}_{timestamp}.log")
+    setup_logging(log_path)
+    logger.info("Log file: %s", log_path)
 
     cfg    = load_config(args.config)
     device = torch.device(cfg.get("device", "cuda"))

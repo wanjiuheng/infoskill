@@ -12,6 +12,7 @@ from collections import defaultdict
 from typing import Callable, Dict, List, Optional
 
 import torch
+from tqdm import tqdm
 
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
@@ -57,14 +58,17 @@ def run_eval(
     results: Dict[str, List[bool]] = defaultdict(list)
 
     with torch.no_grad():
-        for ep_idx in range(n_episodes):
+        pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
+        for ep_idx in pbar:
             env = env_factory()
             obs, info = env.reset()
             task_type = info["task_type"]
             history: List = []
             won = False
+            steps = 0
 
             for step in range(max_steps):
+                steps += 1
                 # Retrieve skill
                 skill = skill_lib.retrieve_for_encoder(info["task_description"])
 
@@ -147,6 +151,16 @@ def run_eval(
 
             results[task_type].append(won)
             env.close()
+
+            # Per-episode log + progress bar update
+            so_far = sum(sum(v) for v in results.values())
+            total_so_far = sum(len(v) for v in results.values())
+            running_sr = so_far / total_so_far if total_so_far else 0.0
+            pbar.set_postfix(task=task_type[:12], won=won, steps=steps, sr=f"{running_sr:.2f}")
+            logger.info(
+                "ep=%d/%d  task_type=%-25s  won=%-5s  steps=%2d  running_sr=%.2f",
+                ep_idx + 1, n_episodes, task_type, won, steps, running_sr,
+            )
 
     # Compute metrics
     metrics: Dict[str, float] = {}
