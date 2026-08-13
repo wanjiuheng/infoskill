@@ -14,6 +14,7 @@ Design:
 
 from __future__ import annotations
 
+import logging
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from typing import List, Dict, Optional, Tuple, Any
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
 from utils.embedding import get_text_embedding
+
+logger = logging.getLogger("rollout")
 
 
 # ── Prompt template ───────────────────────────────────────────────────────────
@@ -175,38 +178,71 @@ class GroupRolloutCollector:
         # rollout memory from max_steps * group_size.
         with torch.no_grad():
             for step_idx in range(self.max_steps):
-                if not any(active_mask):
+                # Early exit if all episodes are done
+                active_indices = [i for i in range(self.G) if active_mask[i]]
+                if not active_indices:
                     break
 
-                # 1. Retrieve skill for each active episode
-                skill_texts, skill_embs = self._batch_retrieve_skills(
-                    obs_list, info_list, active_mask
+                # 1. Retrieve skill (only for active episodes)
+                skill_texts_active, skill_embs_active = self._batch_retrieve_skills_active(
+                    obs_list, info_list, active_indices
                 )
 
-                # 2. Embed states
-                state_embs = self._batch_embed_states(obs_list, active_mask)  # [G, D]
+                # 2. Embed states (only for active episodes)
+                state_embs_active = self._batch_embed_states_active(
+                    obs_list, active_indices
+                )  # [len(active_indices), D]
 
-                # 3. Encode → z_tilde
-                # Inlined reparameterisation (rather than calling sample_z())
-                # so we can keep `eps` and persist it in the StepRecord —
-                # _fast_update() needs it to reconstruct this exact same
-                # z_tilde later, with gradient attached, from a fresh
-                # (grad-enabled) encoder forward on the same (state_emb,
-                # skill_emb) inputs.
-                skill_emb_t = torch.stack(skill_embs, dim=0)                  # [G, D]
-                mu, log_var = self.encoder(state_embs, skill_emb_t)           # [G, L]
-                std = torch.exp(0.5 * log_var)
-                eps = torch.randn_like(std)
-                z_tilde = mu + std * eps                                      # [G, L]
+                # 3. Encode → z_tilde (only for active episodes)
+                skill_emb_t_active = torch.stack(skill_embs_active, dim=0)  # [n_active, D]
+                mu_active, log_var_active = self.encoder(
+                    state_embs_active, skill_emb_t_active
+                )  # [n_active, L]
+                std_active = torch.exp(0.5 * log_var_active)
+                eps_active = torch.randn_like(std_active)
+                z_tilde_active = mu_active + std_active * eps_active  # [n_active, L]
 
-                # 4. Project → soft prefix
-                soft_prefix = self.projector(z_tilde)                         # [G, m, H]
+                # 4. Project → soft prefix (only for active episodes)
+                soft_prefix_active = self.projector(z_tilde_active)  # [n_active, m, H]
 
-                # 5. Build prompts and run LLM.generate() with soft prefix
-                actions_raw, prompt_ids_list, gen_ids_list = self._batch_generate(
-                    obs_list, info_list, history_list, skill_texts,
-                    soft_prefix, active_mask,
+                # 5. Build prompts and run LLM.generate() (only for active episodes)
+                actions_raw_active, prompt_ids_active, gen_ids_active, token_counts = self._batch_generate_active(
+                    obs_list, info_list, history_list, skill_texts_active,
+                    soft_prefix_active, active_indices,
                 )
+
+                # Map active results back to full G indices
+                skill_texts_full = [""] * self.G
+                skill_embs_full = [torch.zeros_like(skill_embs_active[0])] * self.G
+                mu_full = torch.zeros(self.G, mu_active.size(1), device=mu_active.device)
+                log_var_full = torch.zeros(self.G, log_var_active.size(1), device=log_var_active.device)
+                z_tilde_full = torch.zeros(self.G, z_tilde_active.size(1), device=z_tilde_active.device)
+                eps_full = torch.zeros(self.G, eps_active.size(1), device=eps_active.device)
+                state_embs_full = torch.zeros(self.G, state_embs_active.size(1), device=state_embs_active.device)
+                actions_raw_full = [""] * self.G
+                prompt_ids_full = [torch.tensor([]) for _ in range(self.G)]
+                gen_ids_full = [torch.tensor([]) for _ in range(self.G)]
+
+                for idx, i in enumerate(active_indices):
+                    skill_texts_full[i] = skill_texts_active[idx]
+                    skill_embs_full[i] = skill_embs_active[idx]
+                    mu_full[i] = mu_active[idx]
+                    log_var_full[i] = log_var_active[idx]
+                    z_tilde_full[i] = z_tilde_active[idx]
+                    eps_full[i] = eps_active[idx]
+                    state_embs_full[i] = state_embs_active[idx]
+                    actions_raw_full[i] = actions_raw_active[idx]
+                    prompt_ids_full[i] = prompt_ids_active[idx]
+                    gen_ids_full[i] = gen_ids_active[idx]
+
+                # Log token count statistics
+                if token_counts:
+                    avg_tokens = sum(token_counts) / len(token_counts)
+                    logger.info(
+                        f"Step {step_idx}: {len(active_indices)} active envs, "
+                        f"generated tokens: min={min(token_counts)}, max={max(token_counts)}, "
+                        f"avg={avg_tokens:.1f}"
+                    )
 
                 # 6. Parse actions, step envs, record
                 for i in range(self.G):
@@ -214,18 +250,18 @@ class GroupRolloutCollector:
                         # Still create a placeholder record to keep tensor shapes aligned
                         buf.records.append(StepRecord(
                             ep_idx=i, step_idx=step_idx,
-                            state_text=obs_list[i], skill_text=skill_texts[i],
-                            state_emb=state_embs[i].detach(),
-                            skill_emb=skill_emb_t[i].detach(),
-                            mu=mu[i].detach(), log_var=log_var[i].detach(),
-                            z_tilde=z_tilde[i].detach(), eps=eps[i].detach(),
-                            prompt_ids=prompt_ids_list[i], gen_ids=gen_ids_list[i],
+                            state_text=obs_list[i], skill_text=skill_texts_full[i],
+                            state_emb=state_embs_full[i].detach(),
+                            skill_emb=skill_embs_full[i].detach(),
+                            mu=mu_full[i].detach(), log_var=log_var_full[i].detach(),
+                            z_tilde=z_tilde_full[i].detach(), eps=eps_full[i].detach(),
+                            prompt_ids=prompt_ids_full[i], gen_ids=gen_ids_full[i],
                             action="", reward=0.0, done=True, is_valid=False,
                             is_padding=True,
                         ))
                         continue
 
-                    action_text, is_valid = parse_action(actions_raw[i])
+                    action_text, is_valid = parse_action(actions_raw_full[i])
                     action_text = match_admissible(
                         action_text, info_list[i]["admissible_commands"]
                     )
@@ -241,12 +277,12 @@ class GroupRolloutCollector:
 
                     buf.records.append(StepRecord(
                         ep_idx=i, step_idx=step_idx,
-                        state_text=obs_list[i], skill_text=skill_texts[i],
-                        state_emb=state_embs[i].detach(),
-                        skill_emb=skill_emb_t[i].detach(),
-                        mu=mu[i].detach(), log_var=log_var[i].detach(),
-                        z_tilde=z_tilde[i].detach(), eps=eps[i].detach(),
-                        prompt_ids=prompt_ids_list[i], gen_ids=gen_ids_list[i],
+                        state_text=obs_list[i], skill_text=skill_texts_full[i],
+                        state_emb=state_embs_full[i].detach(),
+                        skill_emb=skill_embs_full[i].detach(),
+                        mu=mu_full[i].detach(), log_var=log_var_full[i].detach(),
+                        z_tilde=z_tilde_full[i].detach(), eps=eps_full[i].detach(),
+                        prompt_ids=prompt_ids_full[i], gen_ids=gen_ids_full[i],
                         action=action_text, reward=reward, done=done, is_valid=is_valid,
                         is_padding=False,
                     ))
@@ -274,27 +310,27 @@ class GroupRolloutCollector:
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _batch_embed_states(
+    def _batch_embed_states_active(
         self,
-        obs_list:    List[str],
-        active_mask: List[bool],
+        obs_list:       List[str],
+        active_indices: List[int],
     ) -> torch.Tensor:
-        """Embed all G observations; inactive ones reuse last obs (no env call)."""
-        # Embed all G obs (active and inactive alike) for tensor-shape consistency
+        """Embed only active observations."""
+        active_obs = [obs_list[i] for i in active_indices]
         return get_text_embedding(
-            obs_list, self.model, self.tokenizer, self.device
-        )  # [G, hidden]
+            active_obs, self.model, self.tokenizer, self.device
+        )  # [n_active, hidden]
 
-    def _batch_retrieve_skills(
+    def _batch_retrieve_skills_active(
         self,
-        obs_list:    List[str],
-        info_list:   List[Dict],
-        active_mask: List[bool],
+        obs_list:       List[str],
+        info_list:      List[Dict],
+        active_indices: List[int],
     ) -> Tuple[List[str], List[torch.Tensor]]:
-        """Retrieve one skill per episode using the task description."""
+        """Retrieve skills only for active episodes."""
         skill_texts = []
         skill_embs  = []
-        for i in range(self.G):
+        for i in active_indices:
             skill = self.skill_lib.retrieve_for_encoder(
                 info_list[i]["task_description"]
             )
@@ -340,39 +376,28 @@ class GroupRolloutCollector:
             admissible=admissible_str,
         )
 
-    def _batch_generate(
+    def _batch_generate_active(
         self,
-        obs_list:    List[str],
-        info_list:   List[Dict],
-        history_list: List[List[Tuple]],
-        skill_texts: List[str],
-        soft_prefix: torch.Tensor,   # [G, m, hidden]
-        active_mask: List[bool],
-    ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor]]:
+        obs_list:       List[str],
+        info_list:      List[Dict],
+        history_list:   List[List[Tuple]],
+        skill_texts:    List[str],
+        soft_prefix:    torch.Tensor,   # [n_active, m, hidden]
+        active_indices: List[int],
+    ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor], List[int]]:
         """
-        Run model.generate() with soft_prefix prepended to inputs_embeds.
-
-        For inactive episodes we still include them in the batch (fixed-size)
-        but don't use their output.
-
-        No log-prob is computed here anymore — that used to require a second
-        forward pass *with gradient*, and the resulting graph had to stay
-        alive until the group's backward() call. Instead we hand back the raw
-        token ids needed to recompute that forward pass later, on demand, in
-        InfoskillTrainer._fast_update() via recompute_step_batch().
+        Run model.generate() only for active episodes with soft_prefix prepended.
 
         Returns:
-            actions_raw:      List[str] of raw LLM outputs (length G).
-            prompt_ids_list:  List of 1-D LongTensors, one per episode — the
-                               real (non-padding) prompt token ids for that
-                               row, recovered via attention_mask.
-            gen_ids_list:     List of 1-D LongTensors, one per episode — the
-                               generated token ids (uniform length across the
-                               batch for this step, as produced by generate()).
+            actions_raw:      List[str] of raw LLM outputs (length n_active).
+            prompt_ids_list:  List of 1-D LongTensors (length n_active).
+            gen_ids_list:     List of 1-D LongTensors (length n_active).
+            token_counts:     List[int] of actual token counts generated (length n_active).
         """
+        n_active = len(active_indices)
         prompts = [
-            self._build_prompt(obs_list[i], info_list[i], history_list[i], skill_texts[i])
-            for i in range(self.G)
+            self._build_prompt(obs_list[i], info_list[i], history_list[i], skill_texts[idx])
+            for idx, i in enumerate(active_indices)
         ]
 
         # Apply chat template and tokenise
@@ -395,19 +420,15 @@ class GroupRolloutCollector:
 
         # Get token embeddings for the prompt portion
         embed_layer = self.model.get_input_embeddings()
-        input_embeds = embed_layer(enc.input_ids)         # [G, seq_len, H]
+        input_embeds = embed_layer(enc.input_ids)         # [n_active, seq_len, H]
 
         # Prepend soft prefix: [soft_prefix | input_embeds]
-        # soft_prefix comes from the (float32) Projector while input_embeds is
-        # whatever dtype the backbone uses (bfloat16) — cast to match, or
-        # torch.cat silently upcasts the whole tensor to float32 and every
-        # downstream Linear layer (bfloat16 weights) errors out.
         soft_prefix = soft_prefix.to(input_embeds.dtype)
-        inputs_embeds = torch.cat([soft_prefix, input_embeds], dim=1)  # [G, m+seq, H]
+        inputs_embeds = torch.cat([soft_prefix, input_embeds], dim=1)  # [n_active, m+seq, H]
 
         # Extend attention mask to cover the prefix tokens (all 1s)
         prefix_mask = torch.ones(
-            self.G, soft_prefix.size(1),
+            n_active, soft_prefix.size(1),
             dtype=enc.attention_mask.dtype, device=self.device,
         )
         attention_mask = torch.cat([prefix_mask, enc.attention_mask], dim=1)
@@ -422,23 +443,24 @@ class GroupRolloutCollector:
             pad_token_id=self.tokenizer.eos_token_id,
         )
 
-        # generate() only returns newly generated tokens when called with
-        # inputs_embeds (there's no input_ids for it to echo back), so the
-        # entire output is the generated portion.
-        gen_ids_full = output_ids  # [G, gen_len]
+        # generate() only returns newly generated tokens when called with inputs_embeds
+        gen_ids_full = output_ids  # [n_active, gen_len]
 
         actions_raw = []
         prompt_ids_list: List[torch.Tensor] = []
         gen_ids_list:    List[torch.Tensor] = []
-        for i in range(self.G):
+        token_counts:    List[int] = []
+
+        for i in range(n_active):
             text = self.tokenizer.decode(gen_ids_full[i], skip_special_tokens=True)
             actions_raw.append(text)
 
-            # Strip left/right padding from the prompt row using
-            # attention_mask, so the recompute step in _fast_update() doesn't
-            # need to know this batch's padding scheme.
+            # Strip left/right padding from the prompt row
             valid = enc.attention_mask[i].bool()
             prompt_ids_list.append(enc.input_ids[i][valid].detach().cpu())
             gen_ids_list.append(gen_ids_full[i].detach().cpu())
 
-        return actions_raw, prompt_ids_list, gen_ids_list
+            # Count actual generated tokens (non-padding)
+            token_counts.append(len(gen_ids_full[i]))
+
+        return actions_raw, prompt_ids_list, gen_ids_list, token_counts

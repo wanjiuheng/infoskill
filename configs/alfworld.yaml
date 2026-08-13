@@ -33,7 +33,7 @@ loss:
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
-  group_size: 8               # G: parallel episodes per task
+  group_size: 4               # G: parallel episodes per task
   max_steps: 50               # max steps per episode
   max_new_tokens: 128         # LLM generation budget per step
   temperature: 0.9
@@ -42,7 +42,7 @@ rollout:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  num_episodes: 5000          # total episodes (outer loop)
+  num_episodes: 14212          # total episodes (3553 games × 4)
   learning_rate: 1.0e-4        # NOTE: PyYAML parses "1e-4" (no decimal point) as a
                                 # string, not a float — always write "1.0e-4" style.
   grad_clip: 1.0
@@ -55,7 +55,7 @@ training:
 
   # Checkpointing
   save_freq: 200              # save checkpoint every N episodes (must be multiple of
-                                # rollout.group_size=8 or the modulo never hits 0)
+                                # rollout.group_size=4 or the modulo never hits 0)
   eval_freq: 40               # run eval every N episodes (must be a multiple of
                                 # rollout.group_size, or episode_count % eval_freq
                                 # never hits 0 and eval silently never runs)
