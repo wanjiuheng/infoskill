@@ -155,6 +155,8 @@ class GroupRolloutCollector:
         active_mask:   List[bool]          = [True] * self.G
         ep_rewards:    List[float]         = [0.0]  * self.G
         ep_steps_buf:  List[List[Dict]]    = [[]    for _ in range(self.G)]  # for skill gen
+        ep_token_total: List[int]          = [0]    * self.G  # 每个 episode 累计生成的 token 数
+        ep_step_count:  List[int]          = [0]    * self.G  # 每个 episode 实际走了多少步
 
         for env in self.envs:
             obs, info = env.reset()
@@ -235,14 +237,15 @@ class GroupRolloutCollector:
                     prompt_ids_full[i] = prompt_ids_active[idx]
                     gen_ids_full[i] = gen_ids_active[idx]
 
-                # Log token count statistics
+                # Log per-env token counts for this step, and accumulate per-episode totals
                 if token_counts:
-                    avg_tokens = sum(token_counts) / len(token_counts)
-                    logger.info(
-                        f"Step {step_idx}: {len(active_indices)} active envs, "
-                        f"generated tokens: min={min(token_counts)}, max={max(token_counts)}, "
-                        f"avg={avg_tokens:.1f}"
+                    detail = ", ".join(
+                        f"env_{i}={tok}tok" for i, tok in zip(active_indices, token_counts)
                     )
+                    logger.info(f"Step {step_idx}: {detail}")
+                    for idx, i in enumerate(active_indices):
+                        ep_token_total[i] += token_counts[idx]
+                        ep_step_count[i]  += 1
 
                 # 6. Parse actions, step envs, record
                 for i in range(self.G):
@@ -292,8 +295,32 @@ class GroupRolloutCollector:
 
                     if done:
                         active_mask[i] = False
+                        avg_tok = ep_token_total[i] / max(ep_step_count[i], 1)
+                        logger.info(
+                            f"Episode {i} finished: {ep_step_count[i]} steps, "
+                            f"{ep_token_total[i]} tokens total (avg {avg_tok:.1f} tokens/step), "
+                            f"reward={ep_rewards[i]:.2f}, success={ep_rewards[i] >= 1.0}"
+                        )
+
+        # Any episode that ran to max_steps without setting done=True never hit
+        # the "Episode finished" log above — log it here.
+        for i in range(self.G):
+            if active_mask[i]:
+                avg_tok = ep_token_total[i] / max(ep_step_count[i], 1)
+                logger.info(
+                    f"Episode {i} finished: {ep_step_count[i]} steps, "
+                    f"{ep_token_total[i]} tokens total (avg {avg_tok:.1f} tokens/step), "
+                    f"reward={ep_rewards[i]:.2f}, success={ep_rewards[i] >= 1.0} (hit max_steps)"
+                )
 
         buf.total_rewards = ep_rewards
+        group_success = sum(1 for r in ep_rewards if r >= 1.0)
+        logger.info(
+            f"Group finished: {self.G} episodes, "
+            f"avg {sum(ep_step_count) / self.G:.1f} steps, "
+            f"avg {sum(ep_token_total) / self.G:.1f} tokens, "
+            f"success_rate={group_success / self.G:.2f}"
+        )
 
         # Collect successful trajectories for Slow Module
         # 训练早期：放宽到 ≤50 步成功都收集（reward ≥ 5.0）
