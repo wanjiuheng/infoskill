@@ -48,7 +48,7 @@ def run_eval(
     rcfg       = trainer.cfg.get("rollout", {})
 
     max_steps      = rcfg.get("max_steps", 50)
-    max_new_tokens = rcfg.get("max_new_tokens", 128)
+    max_new_tokens = rcfg.get("max_new_tokens", 256)  # 增大到 256，避免 LLM 输出被截断
     history_len    = rcfg.get("history_len", 3)
 
     # Put modules in eval mode
