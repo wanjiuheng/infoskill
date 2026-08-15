@@ -140,9 +140,9 @@ def run_eval(
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
-                prompt_len = soft_prefix.size(1) + enc.input_ids.shape[1]
+                # generate() only returns newly generated tokens when called with inputs_embeds
                 raw_output = tokenizer.decode(
-                    output_ids[0, prompt_len:], skip_special_tokens=True
+                    output_ids[0], skip_special_tokens=True
                 )
                 action_text, _ = parse_action(raw_output)
                 matched_action = match_admissible(
