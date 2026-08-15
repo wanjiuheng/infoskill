@@ -70,6 +70,12 @@ def run_eval(
             won = False
             steps = 0
 
+            # 记录 episode 开始信息
+            logger.info(
+                "\n=== Episode %d/%d START ===\ntask_type=%s\ntask_desc=%s\ninitial_obs=%s",
+                ep_idx + 1, n_episodes, task_type, info["task_description"], obs[:200]
+            )
+
             for step in range(max_steps):
                 steps += 1
                 # Retrieve skill
@@ -139,17 +145,38 @@ def run_eval(
                     output_ids[0, prompt_len:], skip_special_tokens=True
                 )
                 action_text, _ = parse_action(raw_output)
-                action_text = match_admissible(
+                matched_action = match_admissible(
                     action_text, info["admissible_commands"]
                 )
 
-                obs, reward, done, info = env.step(action_text)
-                history.append((obs, action_text))
+                # 每步输出 LLM 生成详情（用于调试）
+                logger.info(
+                    "  ep=%d step=%d | raw_output: %s",
+                    ep_idx + 1, step + 1, raw_output[:200]
+                )
+                logger.info(
+                    "  ep=%d step=%d | parsed_action: %s | matched: %s",
+                    ep_idx + 1, step + 1, action_text, matched_action
+                )
+
+                obs, reward, done, info = env.step(matched_action)
+
+                # 记录 step 结果
+                logger.info(
+                    "  ep=%d step=%d | reward=%.2f done=%s won=%s | obs: %s",
+                    ep_idx + 1, step + 1, reward, done, info["won"], obs[:150]
+                )
+
+                history.append((obs, matched_action))
                 if len(history) > history_len:
                     history.pop(0)
 
                 if done:
                     won = info["won"]
+                    logger.info(
+                        "=== Episode %d/%d DONE === won=%s steps=%d reward=%.2f\n",
+                        ep_idx + 1, n_episodes, won, steps, reward
+                    )
                     break
 
             results[task_type].append(won)
