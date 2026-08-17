@@ -122,6 +122,7 @@ class GroupRolloutCollector:
         skill_lib,
         device:     torch.device,
         cfg:        Dict[str, Any],
+        action_logger = None,  # Optional logger for recording actions
     ) -> None:
         self.envs       = envs
         self.model      = model
@@ -131,6 +132,7 @@ class GroupRolloutCollector:
         self.skill_lib  = skill_lib
         self.device     = device
         self.G          = len(envs)
+        self.action_logger = action_logger
 
         self.max_steps       = cfg.get("max_steps", 50)
         self.max_new_tokens  = cfg.get("max_new_tokens", 128)
@@ -270,14 +272,25 @@ class GroupRolloutCollector:
                         action_text, info_list[i]["admissible_commands"]
                     )
 
-                    next_obs, reward, done, next_info = self.envs[i].step(action_text)
+                    # Log full raw output to action logger (不截断)
+                    if self.action_logger is not None:
+                        self.action_logger.info(
+                            "[Episode %d/%d, Step %d] raw_output: %s",
+                            i + 1, self.G, step_idx + 1, actions_raw_full[i]
+                        )
+                        self.action_logger.info(
+                            "[Episode %d/%d, Step %d] parsed_action: %s | matched: %s",
+                            i + 1, self.G, step_idx + 1, action_text, matched_action
+                        )
+
+                    next_obs, reward, done, next_info = self.envs[i].step(matched_action)
 
                     ep_rewards[i] += reward
-                    history_list[i].append((obs_list[i], action_text))
+                    history_list[i].append((obs_list[i], matched_action))
                     if len(history_list[i]) > self.history_len:
                         history_list[i].pop(0)
 
-                    ep_steps_buf[i].append({"obs": obs_list[i], "action": action_text})
+                    ep_steps_buf[i].append({"obs": obs_list[i], "action": matched_action})
 
                     buf.records.append(StepRecord(
                         ep_idx=i, step_idx=step_idx,
@@ -287,7 +300,7 @@ class GroupRolloutCollector:
                         mu=mu_full[i].detach(), log_var=log_var_full[i].detach(),
                         z_tilde=z_tilde_full[i].detach(), eps=eps_full[i].detach(),
                         prompt_ids=prompt_ids_full[i], gen_ids=gen_ids_full[i],
-                        action=action_text, reward=reward, done=done, is_valid=is_valid,
+                        action=matched_action, reward=reward, done=done, is_valid=is_valid,
                         is_padding=False,
                     ))
 

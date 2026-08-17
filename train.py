@@ -29,12 +29,16 @@ from peft import LoraConfig, get_peft_model
 logger = logging.getLogger("train")
 
 
-def setup_logging(log_dir: str) -> None:
-    """Log to both stdout and a timestamped file under log_dir."""
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(
-        log_dir, f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
-    )
+def setup_logging(log_dir: str, run_log_dir: str) -> None:
+    """
+    Log to both stdout and a timestamped file under log_dir.
+
+    Args:
+        log_dir: Base log directory (e.g., "logs")
+        run_log_dir: Run-specific directory (e.g., "logs/run_20260817_123456")
+    """
+    os.makedirs(run_log_dir, exist_ok=True)
+    log_path = os.path.join(run_log_dir, "train_progress.log")
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -249,7 +253,14 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
 def main():
     args   = parse_args()
     cfg    = load_config(args.config)
-    setup_logging(cfg["paths"]["log_dir"])
+
+    # Create run-specific directory first (same timestamp logic as trainer)
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_log_dir = os.path.join(cfg["paths"]["log_dir"], f"run_{timestamp}")
+    os.makedirs(run_log_dir, exist_ok=True)
+
+    setup_logging(cfg["paths"]["log_dir"], run_log_dir)
 
     wanted_device = cfg.get("device", "cuda")
     if wanted_device.startswith("cuda") and not torch.cuda.is_available():
@@ -308,6 +319,7 @@ def main():
         optimizer=optimizer,
         device=device,
         cfg=cfg,
+        run_log_dir=run_log_dir,  # Pass the run-specific log dir
     )
 
     # Optionally resume

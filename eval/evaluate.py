@@ -27,6 +27,7 @@ def run_eval(
     trainer,               # InfoskillTrainer instance
     env_factory: Callable, # () → AlfworldTextEnv
     n_episodes: int = 64,
+    eval_logger = None,    # Optional logger for eval episodes
 ) -> Dict[str, float]:
     """
     Evaluate the current policy for n_episodes episodes (no gradient).
@@ -48,7 +49,7 @@ def run_eval(
     rcfg       = trainer.cfg.get("rollout", {})
 
     max_steps      = rcfg.get("max_steps", 50)
-    max_new_tokens = rcfg.get("max_new_tokens", 256)  # 增大到 256，避免 LLM 输出被截断
+    max_new_tokens = rcfg.get("max_new_tokens", 128)  # 从配置读取，默认 128
     history_len    = rcfg.get("history_len", 3)
 
     # Put modules in eval mode
@@ -75,6 +76,11 @@ def run_eval(
                 "\n=== Episode %d/%d START ===\ntask_type=%s\ntask_desc=%s\ninitial_obs=%s",
                 ep_idx + 1, n_episodes, task_type, info["task_description"], obs[:200]
             )
+            if eval_logger is not None:
+                eval_logger.info(
+                    "\n=== Episode %d/%d START ===\ntask_type=%s\ntask_desc=%s\ninitial_obs=%s",
+                    ep_idx + 1, n_episodes, task_type, info["task_description"], obs
+                )
 
             for step in range(max_steps):
                 steps += 1
@@ -158,6 +164,15 @@ def run_eval(
                     "  ep=%d step=%d | parsed_action: %s | matched: %s",
                     ep_idx + 1, step + 1, action_text, matched_action
                 )
+                if eval_logger is not None:
+                    eval_logger.info(
+                        "  ep=%d step=%d | raw_output: %s",
+                        ep_idx + 1, step + 1, raw_output
+                    )
+                    eval_logger.info(
+                        "  ep=%d step=%d | parsed_action: %s | matched: %s",
+                        ep_idx + 1, step + 1, action_text, matched_action
+                    )
 
                 obs, reward, done, info = env.step(matched_action)
 
@@ -166,6 +181,11 @@ def run_eval(
                     "  ep=%d step=%d | reward=%.2f done=%s won=%s | obs: %s",
                     ep_idx + 1, step + 1, reward, done, info["won"], obs[:150]
                 )
+                if eval_logger is not None:
+                    eval_logger.info(
+                        "  ep=%d step=%d | reward=%.2f done=%s won=%s | obs: %s",
+                        ep_idx + 1, step + 1, reward, done, info["won"], obs
+                    )
 
                 history.append((obs, matched_action))
                 if len(history) > history_len:
@@ -177,6 +197,11 @@ def run_eval(
                         "=== Episode %d/%d DONE === won=%s steps=%d reward=%.2f\n",
                         ep_idx + 1, n_episodes, won, steps, reward
                     )
+                    if eval_logger is not None:
+                        eval_logger.info(
+                            "=== Episode %d/%d DONE === won=%s steps=%d reward=%.2f\n",
+                            ep_idx + 1, n_episodes, won, steps, reward
+                        )
                     break
 
             results[task_type].append(won)

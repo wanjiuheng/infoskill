@@ -35,7 +35,7 @@ loss:
 rollout:
   group_size: 4               # G: parallel episodes per task
   max_steps: 50               # max steps per episode
-  max_new_tokens: 128         # LLM generation budget per step
+  max_new_tokens: 512         # LLM generation budget per step
   temperature: 0.9
   top_p: 0.9
   history_len: 3              # how many past (obs, action) pairs to include in prompt

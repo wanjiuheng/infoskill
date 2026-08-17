@@ -81,6 +81,7 @@ class InfoskillTrainer:
         optimizer:          torch.optim.Optimizer,
         device:             torch.device,
         cfg:                Dict[str, Any],
+        run_log_dir:        str = None,  # Optional run-specific log dir
     ) -> None:
         self.model             = model
         self.tokenizer         = tokenizer
@@ -127,12 +128,18 @@ class InfoskillTrainer:
 
         # Metrics tracking for loss curve plots
         self._log_dir = cfg.get("paths", {}).get("log_dir", "logs")
-        # Create a unique subdirectory for this training run
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._run_log_dir = os.path.join(self._log_dir, f"run_{timestamp}")
-        os.makedirs(self._run_log_dir, exist_ok=True)
+        # Use provided run_log_dir or create a new one
+        if run_log_dir is not None:
+            self._run_log_dir = run_log_dir
+        else:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._run_log_dir = os.path.join(self._log_dir, f"run_{timestamp}")
+            os.makedirs(self._run_log_dir, exist_ok=True)
         logger.info("Training run log directory: %s", self._run_log_dir)
+
+        # Setup separate loggers for rollout actions and eval episodes
+        self._setup_action_loggers()
 
         self._metrics_history: List[Dict] = []
 
@@ -141,6 +148,30 @@ class InfoskillTrainer:
 
         # Average steps per episode tracking for plot
         self._steps_history: List[Dict] = []  # [{"episode": int, "avg_steps": float}, ...]
+
+    def _setup_action_loggers(self) -> None:
+        """Setup separate loggers for rollout actions and eval episodes."""
+        # Rollout action logger
+        self.action_logger = logging.getLogger("rollout_actions")
+        self.action_logger.setLevel(logging.INFO)
+        self.action_logger.propagate = False  # Don't propagate to root logger
+        action_handler = logging.FileHandler(
+            os.path.join(self._run_log_dir, "rollout_actions.log"),
+            encoding="utf-8"
+        )
+        action_handler.setFormatter(logging.Formatter("%(message)s"))
+        self.action_logger.addHandler(action_handler)
+
+        # Eval episode logger
+        self.eval_logger = logging.getLogger("eval_episodes")
+        self.eval_logger.setLevel(logging.INFO)
+        self.eval_logger.propagate = False
+        eval_handler = logging.FileHandler(
+            os.path.join(self._run_log_dir, "eval_episodes.log"),
+            encoding="utf-8"
+        )
+        eval_handler.setFormatter(logging.Formatter("%(message)s"))
+        self.eval_logger.addHandler(eval_handler)
 
     # ── Main training loop ────────────────────────────────────────────────────
 
@@ -187,6 +218,7 @@ class InfoskillTrainer:
                 skill_lib=self.skill_lib,
                 device=self.device,
                 cfg=self.cfg.get("rollout", {}),
+                action_logger=self.action_logger,  # Pass action logger to rollout
             )
             buf: TrajectoryBuffer = collector.collect()
 
@@ -247,6 +279,17 @@ class InfoskillTrainer:
                 "ETA": f"{eta_seconds/3600:.1f}h" if eta_seconds >= 3600 else f"{eta_seconds/60:.0f}m"
             })
 
+            # 每 50 个 episodes 在 log 中记录进度和剩余时间
+            if self._episode_count % 50 == 0:
+                progress_pct = 100.0 * self._episode_count / self.num_episodes
+                elapsed_str = f"{elapsed/3600:.1f}h" if elapsed >= 3600 else f"{elapsed/60:.0f}m"
+                eta_str = f"{eta_seconds/3600:.1f}h" if eta_seconds >= 3600 else f"{eta_seconds/60:.0f}m"
+                logger.info(
+                    "Progress: %d/%d (%.1f%%) | Elapsed: %s | ETA: %s | SR: %.3f | Loss: %.4f | Skills: %d",
+                    self._episode_count, self.num_episodes, progress_pct,
+                    elapsed_str, eta_str, sr, loss_dict['total'], len(self.skill_lib)
+                )
+
             # Accumulate pending success trajectories
             self._pending_traj.extend(buf.success_trajectories)
 
@@ -266,7 +309,11 @@ class InfoskillTrainer:
             # ── Eval ──────────────────────────────────────────────────────────
             if eval_env_factory is not None and self._episode_count % self.eval_freq == 0:
                 from eval.evaluate import run_eval
-                metrics = run_eval(self, eval_env_factory, n_episodes=self.cfg["training"]["eval_episodes"])
+                metrics = run_eval(
+                    self, eval_env_factory,
+                    n_episodes=self.cfg["training"]["eval_episodes"],
+                    eval_logger=self.eval_logger  # Pass eval logger
+                )
 
                 # Record eval result and plot
                 overall_sr = metrics.get("success/overall", 0.0)
