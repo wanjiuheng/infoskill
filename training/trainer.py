@@ -126,6 +126,13 @@ class InfoskillTrainer:
         self.G               = rcfg.get("group_size", 8)
         self.num_episodes    = tcfg.get("num_episodes", 5000)
 
+        # 阈值式触发（取代 %）：episode_count 每轮 += G*world_size 后不再是
+        # save_freq/eval_freq 的整数倍，用 % 会永不触发。阈值保证多卡/单卡
+        # 语义一致——每累计 save_freq/eval_freq 个全局 episode 触发一次。
+        self._next_save_ep   = self.save_freq
+        self._next_eval_ep   = self.eval_freq
+        self._next_slow_step = self.slow_interval
+
         # Slow Module bookkeeping
         self._global_step: int = 0
         self._episode_count: int = 0
@@ -214,7 +221,9 @@ class InfoskillTrainer:
 
         while self._episode_count < self.num_episodes:
             # ── Create G envs for this group (same task family, different seeds)
-            seed = group_idx * self.G
+            # 不同 rank 取不同的 seed 块（rank 维度分片），同一 rank 组内 G 个 env
+            # 仍共享 seed（GRPO 要求组内同任务）。这样 N 卡一轮 = G*N 个不同任务。
+            seed = (group_idx * self.world_size + self.rank) * self.G
             envs: List[AlfworldTextEnv] = train_envs_factory(seed)
             assert len(envs) == self.G, f"Expected {self.G} envs, got {len(envs)}"
 
@@ -239,9 +248,18 @@ class InfoskillTrainer:
             # ── Fast Module update ────────────────────────────────────────────
             loss_dict = self._fast_update(buf)
 
-            self._episode_count += self.G
+            # episode_count 反映全局进度：N 卡一轮 = G*N 个 episode
+            self._episode_count += self.G * self.world_size
             group_idx += 1
             step_count = sum(1 for r in buf.records if not r.is_padding)
+            # 不同 rank 任务步数可能不同 → global_step 用 all_reduce 同步，
+            # 保证各 rank 的 _global_step 一致（slow_update 触发条件依赖它，否则
+            # rank 间判断不一致会导致 barrier 死锁）。
+            if self.is_ddp:
+                import torch.distributed as dist
+                step_tensor = torch.tensor([step_count], device=self.device, dtype=torch.long)
+                dist.all_reduce(step_tensor, op=dist.ReduceOp.SUM)
+                step_count = step_tensor.item()
             self._global_step += step_count
 
             # ── Logging ───────────────────────────────────────────────────────
@@ -276,8 +294,8 @@ class InfoskillTrainer:
                 "avg_steps": avg_steps,
             })
 
-            # 更新进度条
-            pbar.update(self.G)
+            # 更新进度条（全局进度 = G * world_size）
+            pbar.update(self.G * self.world_size)
             elapsed = time.time() - start_time
             avg_time_per_ep = elapsed / self._episode_count if self._episode_count > 0 else 0
             remaining_eps = self.num_episodes - self._episode_count
@@ -305,7 +323,8 @@ class InfoskillTrainer:
 
             # ── Slow Module ───────────────────────────────────────────────────
             # Only rank 0 performs slow module updates in DDP mode
-            if self._global_step % self.slow_interval == 0 and self._global_step > 0:
+            if self._global_step >= self._next_slow_step and self._global_step > 0:
+                self._next_slow_step += self.slow_interval
                 if self.rank == 0:
                     self._slow_update()
                 # Barrier: ensure all ranks wait for rank 0 to finish slow update
@@ -322,7 +341,8 @@ class InfoskillTrainer:
                 self._save_metrics_csv()  # 保存 CSV 数据
 
             # ── Checkpoint ────────────────────────────────────────────────────
-            if self._episode_count % self.save_freq == 0:
+            if self._episode_count >= self._next_save_ep and self._episode_count > 0:
+                self._next_save_ep += self.save_freq
                 if self.rank == 0:
                     self.save_checkpoint()
                 # Barrier: ensure all ranks wait for rank 0 to finish saving checkpoint
@@ -331,7 +351,8 @@ class InfoskillTrainer:
                     dist.barrier()
 
             # ── Eval ──────────────────────────────────────────────────────────
-            if eval_env_factory is not None and self._episode_count % self.eval_freq == 0:
+            if eval_env_factory is not None and self._episode_count >= self._next_eval_ep and self._episode_count > 0:
+                self._next_eval_ep += self.eval_freq
                 if self.rank == 0:
                     from eval.evaluate import run_eval
                     metrics = run_eval(
@@ -398,7 +419,7 @@ class InfoskillTrainer:
         #    这里的 batch_size 是每次 forward + backward 的 step 数量。
         #    可以根据显存调整；默认 16 是保守值，足够小以避免 OOM，
         #    又不至于让 backward 调用次数过多（过多会稍微增加通信开销）。
-        batch_size = 16
+        batch_size = 4
         self.optimizer.zero_grad()  # 清空梯度，准备累加
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）
@@ -788,6 +809,10 @@ class InfoskillTrainer:
         self.optimizer.load_state_dict(state["optimizer"])
         self._episode_count = state["episode_count"]
         self._global_step   = state["global_step"]
+        # 恢复阈值（下一个触发点 = 当前进度之后最近的一个 freq 整数倍）
+        self._next_save_ep   = (self._episode_count // self.save_freq + 1) * self.save_freq
+        self._next_eval_ep   = (self._episode_count // self.eval_freq + 1) * self.eval_freq
+        self._next_slow_step = (self._global_step // self.slow_interval + 1) * self.slow_interval
         logger.info("Loaded checkpoint from %s (episode %d)", path, self._episode_count)
 
     def _save_metrics_plot(self) -> None:
