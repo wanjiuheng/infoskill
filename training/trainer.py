@@ -82,6 +82,9 @@ class InfoskillTrainer:
         device:             torch.device,
         cfg:                Dict[str, Any],
         run_log_dir:        str = None,  # Optional run-specific log dir
+        is_ddp:             bool = False,  # DDP mode flag
+        rank:               int = 0,       # DDP rank
+        world_size:         int = 1,       # DDP world size
     ) -> None:
         self.model             = model
         self.tokenizer         = tokenizer
@@ -95,6 +98,9 @@ class InfoskillTrainer:
         self.optimizer         = optimizer
         self.device            = device
         self.cfg               = cfg
+        self.is_ddp            = is_ddp
+        self.rank              = rank
+        self.world_size        = world_size
 
         # Hyperparameters
         tcfg = cfg.get("training", {})
@@ -294,39 +300,59 @@ class InfoskillTrainer:
             self._pending_traj.extend(buf.success_trajectories)
 
             # ── Slow Module ───────────────────────────────────────────────────
+            # Only rank 0 performs slow module updates in DDP mode
             if self._global_step % self.slow_interval == 0 and self._global_step > 0:
-                self._slow_update()
+                if self.rank == 0:
+                    self._slow_update()
+                # Barrier: ensure all ranks wait for rank 0 to finish slow update
+                # (skill library might be updated, need to sync before next rollout)
+                if self.is_ddp:
+                    import torch.distributed as dist
+                    dist.barrier()
 
             # ── Save metrics plot (每个 group 后更新) ──────────────────────────
-            self._save_metrics_plot()
-            self._save_steps_plot()
-            self._save_metrics_csv()  # 保存 CSV 数据
+            # Only rank 0 saves plots/CSV in DDP mode
+            if self.rank == 0:
+                self._save_metrics_plot()
+                self._save_steps_plot()
+                self._save_metrics_csv()  # 保存 CSV 数据
 
             # ── Checkpoint ────────────────────────────────────────────────────
             if self._episode_count % self.save_freq == 0:
-                self.save_checkpoint()
+                if self.rank == 0:
+                    self.save_checkpoint()
+                # Barrier: ensure all ranks wait for rank 0 to finish saving checkpoint
+                if self.is_ddp:
+                    import torch.distributed as dist
+                    dist.barrier()
 
             # ── Eval ──────────────────────────────────────────────────────────
             if eval_env_factory is not None and self._episode_count % self.eval_freq == 0:
-                from eval.evaluate import run_eval
-                metrics = run_eval(
-                    self, eval_env_factory,
-                    n_episodes=self.cfg["training"]["eval_episodes"],
-                    eval_logger=self.eval_logger  # Pass eval logger
-                )
+                if self.rank == 0:
+                    from eval.evaluate import run_eval
+                    metrics = run_eval(
+                        self, eval_env_factory,
+                        n_episodes=self.cfg["training"]["eval_episodes"],
+                        eval_logger=self.eval_logger  # Pass eval logger
+                    )
 
-                # Record eval result and plot
-                overall_sr = metrics.get("success/overall", 0.0)
-                self._eval_history.append({
-                    "episode": self._episode_count,
-                    "success_rate": overall_sr,
-                })
-                self._save_eval_plot()
-                self._save_eval_csv()  # 保存 eval CSV 数据
+                    # Record eval result and plot
+                    overall_sr = metrics.get("success/overall", 0.0)
+                    self._eval_history.append({
+                        "episode": self._episode_count,
+                        "success_rate": overall_sr,
+                    })
+                    self._save_eval_plot()
+                    self._save_eval_csv()  # 保存 eval CSV 数据
+                # Barrier: ensure all ranks wait for rank 0 to finish evaluation
+                if self.is_ddp:
+                    import torch.distributed as dist
+                    dist.barrier()
 
         logger.info("Training complete after %d episodes.", self._episode_count)
         pbar.close()
-        self.save_checkpoint(final=True)
+        if self.rank == 0:
+            self.save_checkpoint(final=True)
 
     # ── Fast Module update ────────────────────────────────────────────────────
 
@@ -453,6 +479,10 @@ class InfoskillTrainer:
         # 5. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）
         nn.utils.clip_grad_norm_(self._all_params(), self.grad_clip)
         self.optimizer.step()
+
+        # 6. In DDP mode, synchronize gradients across all processes
+        # Note: DDP already handles gradient synchronization automatically during backward(),
+        # so no explicit sync is needed here. The gradients are already averaged across ranks.
 
         # 6. 更新 usage history（用于 Slow Module MIG 计算）
         with torch.no_grad():
@@ -706,13 +736,16 @@ class InfoskillTrainer:
                     yield p
 
     def save_checkpoint(self, final: bool = False) -> None:
-        """Save model weights and auxiliary module states."""
+        """Save model weights and auxiliary module states. (DDP: only rank 0 calls this)"""
         tag = "final" if final else f"ep{self._episode_count}"
         path = os.path.join(self.checkpoint_dir, tag)
         os.makedirs(path, exist_ok=True)
 
+        # In DDP mode, unwrap the model to get the base model for saving
+        model_to_save = self.model.module if self.is_ddp else self.model
+
         # Save LoRA adapter weights
-        self.model.save_pretrained(os.path.join(path, "lora"))
+        model_to_save.save_pretrained(os.path.join(path, "lora"))
 
         # Save auxiliary modules
         torch.save({

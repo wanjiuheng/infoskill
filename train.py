@@ -4,7 +4,13 @@ train.py
 Entry point for InfoSkill training.
 
 Usage:
+    # Single GPU
     python train.py --config configs/alfworld.yaml
+
+    # Multi-GPU DDP (specify GPUs with CUDA_VISIBLE_DEVICES)
+    CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py --config configs/alfworld.yaml
+    CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py --config configs/alfworld.yaml
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 train.py --config configs/alfworld.yaml
 
 The script:
   1. Loads config from YAML.
@@ -13,6 +19,7 @@ The script:
   4. Creates env factories for train and eval.
   5. Builds a single AdamW optimiser over all trainable params.
   6. Runs InfoskillTrainer.train().
+  7. Supports DDP (DistributedDataParallel) for multi-GPU training.
 """
 
 import argparse
@@ -23,6 +30,7 @@ import random
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 from peft import LoraConfig, get_peft_model
 
@@ -78,17 +86,43 @@ def load_config(path: str) -> dict:
 
 # ── Reproducibility ───────────────────────────────────────────────────────────
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def set_seed(seed: int, rank: int = 0) -> None:
+    """Set random seed for reproducibility. Add rank to seed for DDP."""
+    random.seed(seed + rank)
+    np.random.seed(seed + rank)
+    torch.manual_seed(seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed + rank)
+
+
+# ── DDP utilities ─────────────────────────────────────────────────────────────
+
+def setup_ddp():
+    """Initialize DDP if launched with torchrun, otherwise return single-GPU info."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        # Launched with torchrun
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+
+        return True, rank, local_rank, world_size
+    else:
+        # Single GPU mode
+        return False, 0, 0, 1
+
+
+def cleanup_ddp(is_ddp: bool):
+    """Clean up DDP process group."""
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 # ── Model setup ───────────────────────────────────────────────────────────────
 
-def build_model_and_tokenizer(cfg: dict, device: torch.device):
+def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = False):
     """Load Qwen2.5-7B-Instruct (text-only), freeze backbone, apply LoRA."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -99,12 +133,22 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    # In DDP mode, don't use device_map="auto" (conflicts with DDP)
+    # Load model to specified device directly
+    if is_ddp:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        model = model.to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
 
     # Freeze backbone
     for param in model.parameters():
@@ -122,7 +166,14 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device):
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    model = model.to(device)
+
+    # In DDP mode, wrap with DistributedDataParallel
+    if is_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[device.index], output_device=device.index)
+        logger.info("Wrapped model with DDP")
+    else:
+        model = model.to(device)
 
     # Trade compute for memory: without this, the full-sequence forward pass in
     # rollout._compute_log_probs() (needed to get a differentiable log-prob for
@@ -131,8 +182,9 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device):
     # required alongside it — with a frozen base model + inputs_embeds (not
     # input_ids), gradient checkpointing otherwise can't recompute activations
     # on the backward pass because the checkpointed input doesn't require grad.
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    base_model = model.module if is_ddp else model
+    base_model.gradient_checkpointing_enable()
+    base_model.enable_input_require_grads()
 
     return model, tokenizer
 
@@ -251,16 +303,34 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Setup DDP first
+    is_ddp, rank, local_rank, world_size = setup_ddp()
+
     args   = parse_args()
     cfg    = load_config(args.config)
 
-    # Create run-specific directory first (same timestamp logic as trainer)
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_log_dir = os.path.join(cfg["paths"]["log_dir"], f"run_{timestamp}")
-    os.makedirs(run_log_dir, exist_ok=True)
+    # Only rank 0 creates log directory
+    if rank == 0:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_log_dir = os.path.join(cfg["paths"]["log_dir"], f"run_{timestamp}")
+        os.makedirs(run_log_dir, exist_ok=True)
+    else:
+        run_log_dir = None
+
+    # Broadcast run_log_dir from rank 0 to all ranks
+    if is_ddp:
+        if rank == 0:
+            run_log_dir_list = [run_log_dir]
+        else:
+            run_log_dir_list = [None]
+        dist.broadcast_object_list(run_log_dir_list, src=0)
+        run_log_dir = run_log_dir_list[0]
 
     setup_logging(cfg["paths"]["log_dir"], run_log_dir)
+
+    if is_ddp:
+        logger.info("DDP initialized: rank=%d, local_rank=%d, world_size=%d", rank, local_rank, world_size)
 
     wanted_device = cfg.get("device", "cuda")
     if wanted_device.startswith("cuda") and not torch.cuda.is_available():
@@ -273,22 +343,29 @@ def main():
             "CUDA build) and reinstall a matching torch wheel. To force CPU "
             "anyway, set device: cpu in the config." % wanted_device
         )
-    device = torch.device(wanted_device)
-    set_seed(cfg.get("seed", 42))
+
+    # In DDP mode, use local_rank as device
+    if is_ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(wanted_device)
+
+    set_seed(cfg.get("seed", 42), rank)
 
     logger.info("Device: %s", device)
 
     # Build model + tokenizer
-    model, tokenizer = build_model_and_tokenizer(cfg, device)
+    model, tokenizer = build_model_and_tokenizer(cfg, device, is_ddp)
 
     # Build fast modules
     encoder, prior_net, projector, reward_predictor, grounding_decoder = build_fast_modules(cfg, device)
 
-    # Build skill library
+    # Build skill library - need to pass the base model (unwrapped)
     from skill_library.library import SkillLibrary
+    base_model = model.module if is_ddp else model
     skill_lib = SkillLibrary(
         json_path=cfg["paths"]["skills_json"],
-        model=model,
+        model=base_model,
         tokenizer=tokenizer,
         device=device,
         top_k_general=cfg["skill_library"]["top_k_general"],
@@ -298,7 +375,7 @@ def main():
 
     # Build skill updater
     from skill_library.skill_updater import SkillUpdater
-    skill_updater = SkillUpdater(model=model, tokenizer=tokenizer, device=device)
+    skill_updater = SkillUpdater(model=base_model, tokenizer=tokenizer, device=device)
 
     # Build optimiser
     aux_modules = [encoder, prior_net, projector, reward_predictor, grounding_decoder]
@@ -320,6 +397,9 @@ def main():
         device=device,
         cfg=cfg,
         run_log_dir=run_log_dir,  # Pass the run-specific log dir
+        is_ddp=is_ddp,
+        rank=rank,
+        world_size=world_size,
     )
 
     # Optionally resume
@@ -331,10 +411,13 @@ def main():
     eval_factory  = make_eval_env_factory(cfg)
 
     # Run
-    trainer.train(
-        train_envs_factory=train_factory,
-        eval_env_factory=eval_factory,
-    )
+    try:
+        trainer.train(
+            train_envs_factory=train_factory,
+            eval_env_factory=eval_factory,
+        )
+    finally:
+        cleanup_ddp(is_ddp)
 
 
 if __name__ == "__main__":
