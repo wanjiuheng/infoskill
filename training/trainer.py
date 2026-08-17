@@ -129,6 +129,9 @@ class InfoskillTrainer:
         self._log_dir = cfg.get("paths", {}).get("log_dir", "logs")
         self._metrics_history: List[Dict] = []
 
+        # Eval success rate tracking for plot
+        self._eval_history: List[Dict] = []  # [{"episode": int, "success_rate": float}, ...]
+
     # ── Main training loop ────────────────────────────────────────────────────
 
     def train(
@@ -243,7 +246,15 @@ class InfoskillTrainer:
             # ── Eval ──────────────────────────────────────────────────────────
             if eval_env_factory is not None and self._episode_count % self.eval_freq == 0:
                 from eval.evaluate import run_eval
-                run_eval(self, eval_env_factory, n_episodes=self.cfg["training"]["eval_episodes"])
+                metrics = run_eval(self, eval_env_factory, n_episodes=self.cfg["training"]["eval_episodes"])
+
+                # Record eval result and plot
+                overall_sr = metrics.get("success/overall", 0.0)
+                self._eval_history.append({
+                    "episode": self._episode_count,
+                    "success_rate": overall_sr,
+                })
+                self._save_eval_plot()
 
         logger.info("Training complete after %d episodes.", self._episode_count)
         pbar.close()
@@ -753,4 +764,37 @@ class InfoskillTrainer:
         plot_path = os.path.join(self._log_dir, "loss_curve.png")
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
+
+    def _save_eval_plot(self) -> None:
+        """
+        Save eval success rate curve to logs/eval_curve.png.
+        Called after each eval run, overwrites previous plot.
+        """
+        if not self._eval_history:
+            return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        episodes = [rec["episode"] for rec in self._eval_history]
+        success_rates = [rec["success_rate"] for rec in self._eval_history]
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(episodes, success_rates, marker="o", linewidth=2, markersize=6, color="tab:blue")
+        ax.set_xlabel("Episode (Checkpoint)", fontsize=12)
+        ax.set_ylabel("Success Rate (140 eval samples)", fontsize=12)
+        ax.set_title("Eval Success Rate Over Training", fontsize=14, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 1.0])
+
+        # Add value labels on each point
+        for ep, sr in zip(episodes, success_rates):
+            ax.text(ep, sr + 0.02, f"{sr:.3f}", ha="center", va="bottom", fontsize=9)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self._log_dir, "eval_curve.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close(fig)
+        logger.info("Eval plot saved: %s", plot_path)
 
