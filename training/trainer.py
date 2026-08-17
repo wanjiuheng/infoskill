@@ -257,6 +257,7 @@ class InfoskillTrainer:
             # ── Save metrics plot (每个 group 后更新) ──────────────────────────
             self._save_metrics_plot()
             self._save_steps_plot()
+            self._save_metrics_csv()  # 保存 CSV 数据
 
             # ── Checkpoint ────────────────────────────────────────────────────
             if self._episode_count % self.save_freq == 0:
@@ -274,6 +275,7 @@ class InfoskillTrainer:
                     "success_rate": overall_sr,
                 })
                 self._save_eval_plot()
+                self._save_eval_csv()  # 保存 eval CSV 数据
 
         logger.info("Training complete after %d episodes.", self._episode_count)
         pbar.close()
@@ -843,4 +845,36 @@ class InfoskillTrainer:
         plot_path = os.path.join(self._run_log_dir, "steps_curve.png")
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
+
+    def _save_metrics_csv(self) -> None:
+        """
+        Save training metrics (loss, success rate, steps, skills) to CSV.
+        """
+        if not self._metrics_history:
+            return
+
+        import csv
+        csv_path = os.path.join(self._run_log_dir, "training_metrics.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "episode", "group", "success_rate", "avg_steps",
+                "total_loss", "policy_loss", "fidelity_loss", "rate_loss", "grounding_loss",
+                "num_skills"
+            ])
+            writer.writeheader()
+            writer.writerows(self._metrics_history)
+
+    def _save_eval_csv(self) -> None:
+        """
+        Save eval success rate history to CSV.
+        """
+        if not self._eval_history:
+            return
+
+        import csv
+        csv_path = os.path.join(self._run_log_dir, "eval_metrics.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["episode", "success_rate"])
+            writer.writeheader()
+            writer.writerows(self._eval_history)
 
