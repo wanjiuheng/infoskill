@@ -56,10 +56,10 @@ training:
   # Checkpointing
   save_freq: 200              # save checkpoint every N episodes (must be multiple of
                                 # rollout.group_size=4 or the modulo never hits 0)
-  eval_freq: 40               # run eval every N episodes (must be a multiple of
+  eval_freq: 200              # run eval every N episodes (must be a multiple of
                                 # rollout.group_size, or episode_count % eval_freq
                                 # never hits 0 and eval silently never runs)
-  eval_episodes: 64           # episodes for evaluation run
+  eval_episodes: 140          # episodes for evaluation run (eval_in_distribution 共 140 个游戏)
 
 # ── Skill Library ─────────────────────────────────────────────────────────────
 skill_library:
