@@ -201,13 +201,43 @@ def run_eval(
     # Compute metrics
     metrics: Dict[str, float] = {}
     all_results: List[bool] = []
-    for task_type, wins in results.items():
-        rate = sum(wins) / len(wins) if wins else 0.0
-        metrics[f"success/{task_type}"] = rate
-        all_results.extend(wins)
-    metrics["success/overall"] = sum(all_results) / len(all_results) if all_results else 0.0
 
-    logger.info("Eval (%d eps): %s", n_episodes, metrics)
+    # 按照 6 个任务类型的顺序输出（与 _TASK_TYPE_KEYWORDS 一致）
+    TASK_ORDER = [
+        "pick_and_place",
+        "look_at_obj_in_light",
+        "clean",
+        "heat",
+        "cool",
+        "examine",
+    ]
+
+    logger.info("\n" + "="*70)
+    logger.info("Eval Results: %d episodes", n_episodes)
+    logger.info("="*70)
+
+    for task_type in TASK_ORDER:
+        if task_type in results:
+            wins = results[task_type]
+            rate = sum(wins) / len(wins) if wins else 0.0
+            metrics[f"success/{task_type}"] = rate
+            all_results.extend(wins)
+            logger.info(
+                "  %-25s  %3d/%3d  %.4f  (%.1f%%)",
+                task_type, sum(wins), len(wins), rate, rate * 100
+            )
+        else:
+            logger.info("  %-25s  %3d/%3d  %.4f  (%.1f%%)", task_type, 0, 0, 0.0, 0.0)
+
+    overall_rate = sum(all_results) / len(all_results) if all_results else 0.0
+    metrics["success/overall"] = overall_rate
+
+    logger.info("-" * 70)
+    logger.info(
+        "  %-25s  %3d/%3d  %.4f  (%.1f%%)",
+        "OVERALL", sum(all_results), len(all_results), overall_rate, overall_rate * 100
+    )
+    logger.info("="*70 + "\n")
 
     # Restore training mode
     model.train()

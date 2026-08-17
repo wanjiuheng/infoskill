@@ -45,7 +45,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate a saved InfoSkill checkpoint on ALFWorld")
     parser.add_argument("--config",      required=True,  help="Path to YAML config (e.g. configs/alfworld.yaml)")
     parser.add_argument("--checkpoint",  required=True,  help="Checkpoint directory (e.g. checkpoints/ep1000)")
-    parser.add_argument("--n_episodes",  type=int, default=64, help="Number of eval episodes (default: 64)")
+    parser.add_argument("--n_episodes",  type=int, default=140, help="Number of eval episodes (default: 140, full eval_in_distribution)")
     parser.add_argument("--log_file",    default=None, help="Path to log file (auto-generated if not set)")
     args = parser.parse_args()
 
@@ -166,14 +166,34 @@ def main():
     logger.info("Starting eval: %d episodes, checkpoint=%s", args.n_episodes, args.checkpoint)
     metrics = run_eval(trainer, eval_env_factory, n_episodes=args.n_episodes)
 
-    lines = [
-        "\n=== Eval Results ===",
-        f"Checkpoint : {args.checkpoint}  (episode {episode_count})",
+    # 按照 6 个任务类型的顺序输出（与 evaluate.py 一致）
+    TASK_ORDER = [
+        "pick_and_place",
+        "look_at_obj_in_light",
+        "clean",
+        "heat",
+        "cool",
+        "examine",
     ]
-    for k, v in sorted(metrics.items()):
-        label = k.replace("success/", "")
-        lines.append(f"  {label:<30s} {v:.4f}  ({v*100:.1f}%)")
-    lines.append("===================\n")
+
+    lines = [
+        "\n" + "="*70,
+        f"Final Eval Results: {args.checkpoint} (episode {episode_count})",
+        "="*70,
+    ]
+    for task_type in TASK_ORDER:
+        key = f"success/{task_type}"
+        if key in metrics:
+            v = metrics[key]
+            lines.append(f"  {task_type:<30s} {v:.4f}  ({v*100:.1f}%)")
+        else:
+            lines.append(f"  {task_type:<30s} 0.0000  (0.0%)")
+
+    lines.append("-" * 70)
+    overall = metrics.get("success/overall", 0.0)
+    lines.append(f"  {'OVERALL':<30s} {overall:.4f}  ({overall*100:.1f}%)")
+    lines.append("="*70 + "\n")
+
     result_str = "\n".join(lines)
     print(result_str)
     logger.info("Final results:\n%s", result_str)
