@@ -268,7 +268,7 @@ class GroupRolloutCollector:
                         continue
 
                     action_text, is_valid = parse_action(actions_raw_full[i])
-                    action_text = match_admissible(
+                    matched_action = match_admissible(
                         action_text, info_list[i]["admissible_commands"]
                     )
 
