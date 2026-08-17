@@ -127,6 +127,13 @@ class InfoskillTrainer:
 
         # Metrics tracking for loss curve plots
         self._log_dir = cfg.get("paths", {}).get("log_dir", "logs")
+        # Create a unique subdirectory for this training run
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._run_log_dir = os.path.join(self._log_dir, f"run_{timestamp}")
+        os.makedirs(self._run_log_dir, exist_ok=True)
+        logger.info("Training run log directory: %s", self._run_log_dir)
+
         self._metrics_history: List[Dict] = []
 
         # Eval success rate tracking for plot
@@ -761,7 +768,7 @@ class InfoskillTrainer:
         axes[1, 1].legend()
 
         plt.tight_layout()
-        plot_path = os.path.join(self._log_dir, "loss_curve.png")
+        plot_path = os.path.join(self._run_log_dir, "loss_curve.png")
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
 
@@ -793,7 +800,7 @@ class InfoskillTrainer:
             ax.text(ep, sr + 0.02, f"{sr:.3f}", ha="center", va="bottom", fontsize=9)
 
         plt.tight_layout()
-        plot_path = os.path.join(self._log_dir, "eval_curve.png")
+        plot_path = os.path.join(self._run_log_dir, "eval_curve.png")
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
         logger.info("Eval plot saved: %s", plot_path)
