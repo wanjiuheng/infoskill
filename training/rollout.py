@@ -87,6 +87,7 @@ class TrajectoryBuffer:
     """Holds all StepRecords from one full Group rollout."""
     records:      List[StepRecord] = field(default_factory=list)
     total_rewards: List[float]     = field(default_factory=list)  # length G
+    total_steps:  List[int]        = field(default_factory=list)  # length G: 每个 episode 的实际步数
     task_type:    str              = "pick_and_place"
     task_description: str         = ""
     success_trajectories: List[Dict] = field(default_factory=list)  # for Slow Module
@@ -314,6 +315,7 @@ class GroupRolloutCollector:
                 )
 
         buf.total_rewards = ep_rewards
+        buf.total_steps = ep_step_count  # 记录每个 episode 的步数
         group_success = sum(1 for r in ep_rewards if r >= 1.0)
         logger.info(
             f"Group finished: {self.G} episodes, "

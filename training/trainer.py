@@ -139,6 +139,9 @@ class InfoskillTrainer:
         # Eval success rate tracking for plot
         self._eval_history: List[Dict] = []  # [{"episode": int, "success_rate": float}, ...]
 
+        # Average steps per episode tracking for plot
+        self._steps_history: List[Dict] = []  # [{"episode": int, "avg_steps": float}, ...]
+
     # ── Main training loop ────────────────────────────────────────────────────
 
     def train(
@@ -201,10 +204,11 @@ class InfoskillTrainer:
 
             # ── Logging ───────────────────────────────────────────────────────
             sr = sum(1 for r in buf.total_rewards if r >= 1.0) / self.G  # 任务完成率（不考虑步数）
+            avg_steps = sum(buf.total_steps) / self.G  # 平均步数
             logger.info(
-                "Episode %d | group %d | success_rate=%.2f | "
+                "Episode %d | group %d | success_rate=%.2f | avg_steps=%.1f | "
                 "loss=%.4f p=%.4f f=%.4f r=%.4f g=%.4f | skills=%d",
-                self._episode_count, group_idx, sr,
+                self._episode_count, group_idx, sr, avg_steps,
                 loss_dict["total"], loss_dict["policy"],
                 loss_dict["fidelity"], loss_dict["rate"], loss_dict["grounding"],
                 len(self.skill_lib),
@@ -215,12 +219,19 @@ class InfoskillTrainer:
                 "episode": self._episode_count,
                 "group": group_idx,
                 "success_rate": sr,
+                "avg_steps": avg_steps,
                 "total_loss": loss_dict["total"],
                 "policy_loss": loss_dict["policy"],
                 "fidelity_loss": loss_dict["fidelity"],
                 "rate_loss": loss_dict["rate"],
                 "grounding_loss": loss_dict["grounding"],
                 "num_skills": len(self.skill_lib),
+            })
+
+            # 记录平均步数历史
+            self._steps_history.append({
+                "episode": self._episode_count,
+                "avg_steps": avg_steps,
             })
 
             # 更新进度条
@@ -245,6 +256,7 @@ class InfoskillTrainer:
 
             # ── Save metrics plot (每个 group 后更新) ──────────────────────────
             self._save_metrics_plot()
+            self._save_steps_plot()
 
             # ── Checkpoint ────────────────────────────────────────────────────
             if self._episode_count % self.save_freq == 0:
@@ -804,4 +816,31 @@ class InfoskillTrainer:
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
         logger.info("Eval plot saved: %s", plot_path)
+
+    def _save_steps_plot(self) -> None:
+        """
+        Save average steps per episode curve to logs/steps_curve.png.
+        Called after each group rollout, overwrites previous plot.
+        """
+        if not self._steps_history:
+            return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        episodes = [rec["episode"] for rec in self._steps_history]
+        avg_steps = [rec["avg_steps"] for rec in self._steps_history]
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(episodes, avg_steps, linewidth=1.5, alpha=0.7, color="tab:orange")
+        ax.set_xlabel("Episode", fontsize=12)
+        ax.set_ylabel("Average Steps per Episode", fontsize=12)
+        ax.set_title("Average Interaction Steps Over Training", fontsize=14, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self._run_log_dir, "steps_curve.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close(fig)
 
