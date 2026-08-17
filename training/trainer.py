@@ -87,6 +87,10 @@ class InfoskillTrainer:
         world_size:         int = 1,       # DDP world size
     ) -> None:
         self.model             = model
+        # Unwrapped model reference for accessing HF methods (get_input_embeddings,
+        # generate, save_pretrained) that DDP doesn't forward. forward/backward
+        # still go through self.model (the DDP wrapper) for gradient sync.
+        self._base_model        = model.module if is_ddp else model
         self.tokenizer         = tokenizer
         self.encoder           = encoder
         self.prior_net         = prior_net
@@ -217,7 +221,7 @@ class InfoskillTrainer:
             # ── Rollout ───────────────────────────────────────────────────────
             collector = GroupRolloutCollector(
                 envs=envs,
-                model=self.model,
+                model=self._base_model,  # 解包模型（rollout 需要 get_input_embeddings/generate）
                 tokenizer=self.tokenizer,
                 encoder=self.encoder,
                 projector=self.projector,
@@ -579,7 +583,7 @@ class InfoskillTrainer:
         prompt_ids_batch = torch.stack(prompt_ids_padded, dim=0)  # [B, max_prompt_len]
         prompt_mask_batch = torch.stack(prompt_mask, dim=0)       # [B, max_prompt_len]
 
-        embed_layer = self.model.get_input_embeddings()
+        embed_layer = self._base_model.get_input_embeddings()
         prompt_embeds = embed_layer(prompt_ids_batch)  # [B, max_prompt_len, H]
 
         # 2. 拼接 soft_prefix
@@ -741,8 +745,8 @@ class InfoskillTrainer:
         path = os.path.join(self.checkpoint_dir, tag)
         os.makedirs(path, exist_ok=True)
 
-        # In DDP mode, unwrap the model to get the base model for saving
-        model_to_save = self.model.module if self.is_ddp else self.model
+        # DDP 模式下用解包模型保存（DDP 对象没有 save_pretrained）
+        model_to_save = self._base_model
 
         # Save LoRA adapter weights
         model_to_save.save_pretrained(os.path.join(path, "lora"))
@@ -766,9 +770,15 @@ class InfoskillTrainer:
     def load_checkpoint(self, path: str) -> None:
         """Load from a previously saved checkpoint directory."""
         from peft import PeftModel
-        self.model = PeftModel.from_pretrained(
-            self.model, os.path.join(path, "lora")
+        # 从解包模型加载 LoRA，DDP 下再重新包装
+        new_model = PeftModel.from_pretrained(
+            self._base_model, os.path.join(path, "lora")
         )
+        if self.is_ddp:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            new_model = DDP(new_model, device_ids=[self.device.index], output_device=self.device.index)
+        self.model = new_model
+        self._base_model = new_model.module if self.is_ddp else new_model
         state = torch.load(os.path.join(path, "aux_modules.pt"), map_location=self.device)
         self.encoder.load_state_dict(state["encoder"])
         self.prior_net.load_state_dict(state["prior_net"])

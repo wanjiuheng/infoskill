@@ -40,7 +40,7 @@ def run_eval(
     Returns:
         Dict with 'overall_success' and per-task-type success rates.
     """
-    model      = trainer.model
+    model      = trainer._base_model  # 解包模型（DDP 对象没有 get_input_embeddings/generate）
     tokenizer  = trainer.tokenizer
     encoder    = trainer.encoder
     projector  = trainer.projector
