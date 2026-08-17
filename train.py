@@ -212,11 +212,16 @@ def make_eval_env_factory(cfg: dict):
     config_path = cfg["paths"]["alfworld_config"]
     max_steps   = cfg["rollout"]["max_steps"]
 
+    # Use a counter to generate different seeds for each episode
+    eval_env_counter = {"count": 0}
+
     def factory():
+        env_seed = eval_env_counter["count"]
+        eval_env_counter["count"] += 1
         return AlfworldTextEnv(
             config_path=config_path,
             train_eval="eval_in_distribution",
-            seed=0,
+            seed=env_seed,
             max_steps=max_steps,
         )
     return factory
