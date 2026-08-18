@@ -23,7 +23,6 @@ The script:
 """
 
 import argparse
-import datetime
 import logging
 import os
 import random
@@ -74,6 +73,13 @@ def parse_args():
         "--resume", type=str, default=None,
         help="Path to checkpoint directory to resume from."
     )
+    parser.add_argument(
+        "--run-name", type=str, default=None,
+        help="Experiment name, used as a subdir under paths.checkpoint_dir and "
+             "paths.log_dir so parallel experiments (different hparams) never "
+             "overwrite each other's checkpoints/logs. Defaults to a timestamp "
+             "(run_YYYYMMDD_HHMMSS) if not given."
+    )
     return parser.parse_args()
 
 
@@ -105,12 +111,7 @@ def setup_ddp():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
 
-        # RL rollout 时间因随机采样在不同 rank 间差异很大，默认 600s 的 NCCL
-        # 超时会在难任务（步数多、生成长）时误杀。放宽到 1 小时避免误杀。
-        dist.init_process_group(
-            backend="nccl",
-            timeout=datetime.timedelta(minutes=60),
-        )
+        dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
 
         return True, rank, local_rank, world_size
@@ -314,25 +315,33 @@ def main():
     args   = parse_args()
     cfg    = load_config(args.config)
 
-    # Only rank 0 creates log directory
+    # Run name: identifies this experiment's checkpoints/logs so parallel runs
+    # with different hparams never overwrite each other. Falls back to a
+    # timestamp so a bare `python train.py` still gets its own subdir.
     if rank == 0:
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_log_dir = os.path.join(cfg["paths"]["log_dir"], f"run_{timestamp}")
-        os.makedirs(run_log_dir, exist_ok=True)
-    else:
-        run_log_dir = None
-
-    # Broadcast run_log_dir from rank 0 to all ranks
-    if is_ddp:
-        if rank == 0:
-            run_log_dir_list = [run_log_dir]
+        if args.run_name:
+            run_name = args.run_name
         else:
-            run_log_dir_list = [None]
-        dist.broadcast_object_list(run_log_dir_list, src=0)
-        run_log_dir = run_log_dir_list[0]
+            from datetime import datetime
+            run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        run_name = None
 
+    # Broadcast run_name from rank 0 to all ranks (all ranks must agree on the
+    # same dirs, and only rank 0 can see the wall-clock timestamp branch above)
+    if is_ddp:
+        run_name_list = [run_name] if rank == 0 else [None]
+        dist.broadcast_object_list(run_name_list, src=0)
+        run_name = run_name_list[0]
+
+    # Namespace checkpoint_dir under the run name (e.g. checkpoints/lr1e-4_bs16/)
+    cfg["paths"]["checkpoint_dir"] = os.path.join(cfg["paths"]["checkpoint_dir"], run_name)
+
+    run_log_dir = os.path.join(cfg["paths"]["log_dir"], run_name)
     setup_logging(cfg["paths"]["log_dir"], run_log_dir)
+    if rank == 0:
+        logger.info("Run name: %s (checkpoint_dir=%s, run_log_dir=%s)",
+                     run_name, cfg["paths"]["checkpoint_dir"], run_log_dir)
 
     if is_ddp:
         logger.info("DDP initialized: rank=%d, local_rank=%d, world_size=%d", rank, local_rank, world_size)
