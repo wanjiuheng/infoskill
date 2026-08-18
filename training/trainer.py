@@ -419,7 +419,7 @@ class InfoskillTrainer:
         #    这里的 batch_size 是每次 forward + backward 的 step 数量。
         #    可以根据显存调整；默认 16 是保守值，足够小以避免 OOM，
         #    又不至于让 backward 调用次数过多（过多会稍微增加通信开销）。
-        batch_size = 4
+        batch_size = 10
         self.optimizer.zero_grad()  # 清空梯度，准备累加
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）
@@ -831,7 +831,7 @@ class InfoskillTrainer:
 
         with open(csv_path, "a", newline="", encoding="utf-8") as f:
             fieldnames = [
-                "episode", "group", "success_rate", "total_loss",
+                "episode", "group", "success_rate", "avg_steps", "total_loss",
                 "policy_loss", "fidelity_loss", "rate_loss", "grounding_loss", "num_skills"
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -909,9 +909,13 @@ class InfoskillTrainer:
         if not self._eval_history:
             return
 
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib 未安装，跳过绘图（pip install matplotlib）")
+            return
 
         episodes = [rec["episode"] for rec in self._eval_history]
         success_rates = [rec["success_rate"] for rec in self._eval_history]
@@ -942,9 +946,13 @@ class InfoskillTrainer:
         if not self._steps_history:
             return
 
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib 未安装，跳过绘图（pip install matplotlib）")
+            return
 
         episodes = [rec["episode"] for rec in self._steps_history]
         avg_steps = [rec["avg_steps"] for rec in self._steps_history]

@@ -105,7 +105,12 @@ def setup_ddp():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
 
-        dist.init_process_group(backend="nccl")
+        # RL rollout 时间因随机采样在不同 rank 间差异很大，默认 600s 的 NCCL
+        # 超时会在难任务（步数多、生成长）时误杀。放宽到 1 小时避免误杀。
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(minutes=60),
+        )
         torch.cuda.set_device(local_rank)
 
         return True, rank, local_rank, world_size

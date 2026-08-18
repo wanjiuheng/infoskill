@@ -13,6 +13,8 @@ accelerate>=0.30.0
 peft>=0.11.0
 pyyaml
 numpy
+tqdm
+matplotlib                      # loss/eval/steps 曲线绘图
 
 # ALFWorld environment (text mode: AlfredTWEnv)
 alfworld
