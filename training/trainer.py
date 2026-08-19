@@ -125,6 +125,9 @@ class InfoskillTrainer:
         self.eval_freq       = tcfg.get("eval_freq", 50)
         self.G               = rcfg.get("group_size", 8)
         self.num_episodes    = tcfg.get("num_episodes", 5000)
+        # _fast_update() 里每次 forward+backward 重算 log_prob 的 mini-batch 大小
+        # （不是 rollout.group_size，那是每组并行跑几局任务，语义不同）
+        self.mini_batch_size = tcfg.get("mini_batch_size", 10)
 
         # 阈值式触发（取代 %）：episode_count 每轮 += G*world_size 后不再是
         # save_freq/eval_freq 的整数倍，用 % 会永不触发。阈值保证多卡/单卡
@@ -207,7 +210,12 @@ class InfoskillTrainer:
         """
         logger.info("InfoskillTrainer: starting training for %d episodes.", self.num_episodes)
 
-        group_idx = 0
+        # resume 时 self._episode_count 是从 checkpoint 读回来的非零值，
+        # 反推出应该从第几组继续（episode_count 与 group_idx 存在确定性的
+        # 线性关系：episode_count = group_idx * G * world_size），这样 resume
+        # 后不会把 group_idx=0 对应的任务重新喂给模型一遍。
+        group_idx = self._episode_count // (self.G * self.world_size)
+        envs: Optional[List[AlfworldTextEnv]] = None
         start_time = time.time()
 
         # 创建进度条
@@ -220,12 +228,19 @@ class InfoskillTrainer:
         )
 
         while self._episode_count < self.num_episodes:
-            # ── Create G envs for this group (same task family, different seeds)
+            # ── Get G envs for this group (same task family, different seeds)
             # 不同 rank 取不同的 seed 块（rank 维度分片），同一 rank 组内 G 个 env
             # 仍共享 seed（GRPO 要求组内同任务）。这样 N 卡一轮 = G*N 个不同任务。
             seed = (group_idx * self.world_size + self.rank) * self.G
-            envs: List[AlfworldTextEnv] = train_envs_factory(seed)
-            assert len(envs) == self.G, f"Expected {self.G} envs, got {len(envs)}"
+            if envs is None:
+                # 只在整个训练/resume 生命周期内构造一次 AlfredTWEnv（每次构造都
+                # 要重扫 train split 下全部目录，是当前最大的单项耗时开销）。
+                # 之后每组只 reseed，复用已建好的 env 对象。
+                envs = train_envs_factory(seed)
+                assert len(envs) == self.G, f"Expected {self.G} envs, got {len(envs)}"
+            else:
+                for env in envs:
+                    env.reseed(seed)
 
             # ── Rollout ───────────────────────────────────────────────────────
             collector = GroupRolloutCollector(
@@ -240,10 +255,6 @@ class InfoskillTrainer:
                 action_logger=self.action_logger,  # Pass action logger to rollout
             )
             buf: TrajectoryBuffer = collector.collect()
-
-            # Clean up envs after rollout
-            for env in envs:
-                env.close()
 
             # ── Fast Module update ────────────────────────────────────────────
             loss_dict = self._fast_update(buf)
@@ -376,6 +387,9 @@ class InfoskillTrainer:
 
         logger.info("Training complete after %d episodes.", self._episode_count)
         pbar.close()
+        if envs is not None:
+            for env in envs:
+                env.close()
         if self.rank == 0:
             self.save_checkpoint(final=True)
 
@@ -416,10 +430,10 @@ class InfoskillTrainer:
         advantages = torch.tensor(adv_list, device=self.device, dtype=torch.float32)  # [N]
 
         # 4. Mini-batch recomputation loop
-        #    这里的 batch_size 是每次 forward + backward 的 step 数量。
-        #    可以根据显存调整；默认 16 是保守值，足够小以避免 OOM，
-        #    又不至于让 backward 调用次数过多（过多会稍微增加通信开销）。
-        batch_size = 10
+        #    self.mini_batch_size（training.mini_batch_size）是每次 forward +
+        #    backward 的 step 数量，可根据显存调整；越小越省显存，但 backward
+        #    调用次数越多（通信开销略增）。
+        batch_size = self.mini_batch_size
         self.optimizer.zero_grad()  # 清空梯度，准备累加
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）

@@ -50,6 +50,7 @@ training:
   learning_rate: 1.0e-4
   grad_clip: 1.0
   batch_accumulation: 1
+  mini_batch_size: 2            # debug 用小值，避免和 group_size=1/max_steps=2 不匹配
 
   # Slow module
   slow_update_interval: 3   # T: steps between library maintenance runs

@@ -77,10 +77,33 @@ def parse_args():
         "--run-name", type=str, default=None,
         help="Experiment name, used as a subdir under paths.checkpoint_dir and "
              "paths.log_dir so parallel experiments (different hparams) never "
-             "overwrite each other's checkpoints/logs. Defaults to a timestamp "
-             "(run_YYYYMMDD_HHMMSS) if not given."
+             "overwrite each other's checkpoints/logs. Defaults to an "
+             "auto-generated name built from the config's key hparams "
+             "(lr/mini_batch_size/max_new_tokens/max_steps) plus a timestamp, "
+             "e.g. lr1e-06_bs10_mnt512_ms30_run_20260818_153000, so the "
+             "directory name alone tells you which hparams produced it."
     )
     return parser.parse_args()
+
+
+def default_run_name(cfg: dict) -> str:
+    """
+    从 config 的关键超参数自动拼出一个可读的 run_name，这样不用手动在
+    --run-name 里重复输入 lr/bs/max_new_tokens/max_steps，也不会写错或漏写
+    ——目录名和实际生效的超参数始终保持一致。
+    """
+    from datetime import datetime
+    tcfg = cfg.get("training", {})
+    rcfg = cfg.get("rollout", {})
+    lr             = float(tcfg.get("learning_rate", 1e-4))
+    mini_batch_size = tcfg.get("mini_batch_size", 10)
+    max_new_tokens  = rcfg.get("max_new_tokens", 512)
+    max_steps       = rcfg.get("max_steps", 50)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        f"lr{lr:.0e}_bs{mini_batch_size}_mnt{max_new_tokens}_ms{max_steps}"
+        f"_run_{timestamp}"
+    )
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
@@ -319,11 +342,7 @@ def main():
     # with different hparams never overwrite each other. Falls back to a
     # timestamp so a bare `python train.py` still gets its own subdir.
     if rank == 0:
-        if args.run_name:
-            run_name = args.run_name
-        else:
-            from datetime import datetime
-            run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = args.run_name if args.run_name else default_run_name(cfg)
     else:
         run_name = None
 
@@ -342,6 +361,12 @@ def main():
     if rank == 0:
         logger.info("Run name: %s (checkpoint_dir=%s, run_log_dir=%s)",
                      run_name, cfg["paths"]["checkpoint_dir"], run_log_dir)
+        # 把本次实际生效的完整 config 存一份快照，避免日后只看 run_name/目录名
+        # 猜不出当时到底用了什么超参数（run_name 只是人起的标签，不保证准确）
+        config_snapshot_path = os.path.join(run_log_dir, "config.yaml")
+        with open(config_snapshot_path, "w", encoding="utf-8") as f:
+            yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
+        logger.info("Config snapshot saved to %s", config_snapshot_path)
 
     if is_ddp:
         logger.info("DDP initialized: rank=%d, local_rank=%d, world_size=%d", rank, local_rank, world_size)

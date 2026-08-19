@@ -228,16 +228,18 @@ nvidia-smi
 
 # 3. 根据空闲 GPU 选择训练配置
 
-# 使用卡 0 和 1（--run-name 区分实验，checkpoints/logs 各自独立子目录）
+# 使用卡 0 和 1（不传 --run-name 时自动按 lr/mini_batch_size/max_new_tokens/
+# max_steps 生成目录名，如 lr1e-04_bs10_mnt512_ms50_run_20260818_153000，
+# checkpoints/logs 各自独立子目录，一眼就能看出这组用了什么超参数）
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train.py \
     --config configs/alfworld.yaml \
-    --run-name exp_gpu01 \
     2>&1 | tee logs/train_gpu01_$(date +%Y%m%d_%H%M%S).log
 
-# 使用卡 2 和 3（另一组实验，不同 --run-name，不会覆盖上面的 checkpoint）
+# 使用卡 2 和 3（另一组实验，改了 configs/alfworld.yaml 里的超参数后直接跑，
+# 自动生成的目录名会不同，不会覆盖上面的 checkpoint；也可以用 --run-name
+# 手动指定一个好记的名字，会覆盖自动生成的规则）
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 train.py \
-    --config configs/alfworld.yaml \
-    --run-name exp_gpu23 \
+    --config configs/alfworld_exp2.yaml \
     2>&1 | tee logs/train_gpu23_$(date +%Y%m%d_%H%M%S).log
 
 # 4. 在另一个终端监控

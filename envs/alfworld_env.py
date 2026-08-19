@@ -83,7 +83,11 @@ class AlfworldTextEnv(BaseEnvWrapper):
         from alfworld.agents.environment import get_environment
         base_env = get_environment("AlfredTWEnv")(config, train_eval=self._train_eval)
         self._env = base_env.init_env(batch_size=1)
-        self._env.seed(self._seed)
+
+        # 保留真实 seed 方法的引用，供 reseed() 复用——它只对 game_files 做一次
+        # 内存内洗牌，不会重新构造 AlfredTWEnv（不会重扫 8810 个目录）。
+        self._real_seed_fn = self._env.seed
+        self._real_seed_fn(self._seed)
 
         # Monkey patch: 禁用 shuffle，改为顺序采样（临时方案，用于遍历全部 3553 个训练样本）
         # 原始的 TextworldBatchGymEnv.seed() 会调用 np.random.shuffle(self.game_files)
@@ -92,6 +96,18 @@ class AlfworldTextEnv(BaseEnvWrapper):
             """空操作版本的 seed()，跳过 shuffle 步骤。"""
             pass
         self._env.seed = _no_shuffle_seed
+
+    def reseed(self, new_seed: int) -> None:
+        """
+        切换到一个新任务，不重新构造 AlfredTWEnv（不重扫 8810 个目录）。
+
+        复用 _init_env() 中保存的真实 seed 方法，对 game_files 重新洗牌（纯
+        内存操作），下一次 reset() 会取到洗牌后列表的第一个文件——效果等价于
+        "新建一个 AlfworldTextEnv(seed=new_seed)"，但省掉了整个 AlfredTWEnv
+        初始化（含目录扫描）的开销。
+        """
+        self._seed = new_seed
+        self._real_seed_fn(new_seed)
 
     def close(self) -> None:
         if self._env is not None:

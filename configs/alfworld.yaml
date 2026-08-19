@@ -47,6 +47,8 @@ training:
                                 # string, not a float — always write "1.0e-4" style.
   grad_clip: 1.0
   batch_accumulation: 1
+  mini_batch_size: 10          # bs：_fast_update() 每次 forward+backward 重算
+                                # log_prob 的 mini-batch 大小（不是 rollout.group_size）
 
   # Slow module
   slow_update_interval: 200   # T: steps between library maintenance runs
