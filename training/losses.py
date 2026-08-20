@@ -103,16 +103,26 @@ def compute_total_loss(
     alpha2:           float = 0.01,
     beta:             float = 0.001,
     mask:             Optional[torch.Tensor] = None,
+    fidelity_mask:    Optional[torch.Tensor] = None,
 ) -> tuple:
     """
     Compute the total InfoSkill loss (paper Eq. 8).
+
+    Args:
+        fidelity_mask: 独立于 mask 的 fidelity-only mask。零方差组（advantage 全 0）
+                       用全 0 掩码跳过 fidelity 监督，避免 RewardPredictor 被教成
+                       常数预测器；policy 项因 advantage=0 天然无梯度，rate 是
+                       压缩正则、与方差无关，两者都不受该 mask 影响。
 
     Returns:
         (total_loss, policy_loss, fidelity_loss, rate_loss, grounding_loss)
         — all scalars.  total_loss is ready for .backward().
     """
     p_loss = compute_policy_loss(log_probs, advantages, mask)
-    f_loss = compute_fidelity_loss(pred_advantage, advantages, mask)
+    f_loss = compute_fidelity_loss(
+        pred_advantage, advantages,
+        fidelity_mask if fidelity_mask is not None else mask,
+    )
     r_loss = compute_rate_loss(mu, log_var, prior_mu, prior_log_var, mask)
     g_loss = grounding_loss   # already a scalar from GroundingDecoder
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import json
 import logging
+import random
 import time
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
@@ -413,9 +414,12 @@ class InfoskillTrainer:
         # 1. 计算 GRPO advantages（每个 episode 一个标量）
         advantages_per_ep = compute_grpo_advantages(buf.total_rewards)  # [G]
 
-        # 2. 过滤出有效的 records（排除 padding placeholders）
+        # 2. 过滤出有效的 records（排除 padding placeholders + 无效动作）
+        #    is_valid=False 表示解析失败（无 <think>/<action> 标签、含中文等），
+        #    生成 token 是乱码/无效输出，不能参与 policy loss——否则成功 episode 里
+        #    的乱码步会被 advantage>0 强化，放训练退化阶段的乱码行为。
         active_records: List[StepRecord] = [
-            r for r in buf.records if not r.is_padding
+            r for r in buf.records if not r.is_padding and r.is_valid
         ]
         if not active_records:
             return {
@@ -424,6 +428,18 @@ class InfoskillTrainer:
             }
 
         N = len(active_records)
+
+        # 零方差组（同组全部 reward 相同 → advantage 全 0）：fidelity 的回归
+        # target 全 0，若照常训练会把 RewardPredictor 教成"对任何输入都预测 0"，
+        # 退化成常数预测器 → MIG 剪枝的 fidelity 项失去区分度。这些组跳过
+        # fidelity 监督（policy 项因 advantage=0 天然无梯度，不受影响；rate 是
+        # 压缩正则、与方差无关，照常计算）。
+        rewards_t = torch.as_tensor(buf.total_rewards, dtype=torch.float32)
+        zero_variance_group = bool(rewards_t.std(unbiased=False) < 1e-6)
+
+        # Grounding loss：每轮从整组有效记录里随机抽 ≤16 条算一次。辅助项不逐
+        # mini-batch 算（省显存），随机抽样避免"总取每组开头几条"的系统偏置。
+        grounding_loss_scalar = self._compute_grounding_loss(active_records)
 
         # 3. Prepare advantage tensor broadcast to each step
         adv_list = [advantages_per_ep[r.ep_idx] for r in active_records]
@@ -476,18 +492,16 @@ class InfoskillTrainer:
                 batch_records, soft_prefix_b
             )  # [B]
 
-            # ── 4e. 计算 prior、reward predictor、grounding loss ──────────────
+            # ── 4e. 计算 prior、reward predictor ─────────────────────────────
             prior_mu_b, prior_logvar_b = self.prior_net(state_embs_b)  # [B, L]
             pred_advantage_b = self.reward_predictor(z_tilde_new, state_embs_b)  # [B]
 
-            # Grounding loss：只在第一个 mini-batch 计算（避免重复计算，
-            # 因为 grounding 是辅助loss，不需要每个 batch 都算）
-            if i == 0:
-                grounding_loss_scalar = self._compute_grounding_loss(batch_records)
-            else:
-                grounding_loss_scalar = torch.tensor(0.0, device=self.device)
-
             # ── 4f. 计算 total loss（这个 mini-batch）───────────────────────
+            # fidelity_mask：零方差组的所有步置 0，跳过 fidelity 监督
+            fidelity_mask_b = (
+                torch.zeros(B, device=self.device, dtype=torch.float32)
+                if zero_variance_group else None
+            )
             total_b, p_b, f_b, r_b, g_b = compute_total_loss(
                 log_probs=log_probs_b,
                 advantages=batch_adv,
@@ -500,7 +514,8 @@ class InfoskillTrainer:
                 alpha1=self.alpha1,
                 alpha2=self.alpha2,
                 beta=self.beta,
-                mask=None,  # 已经过滤掉 padding，不需要 mask
+                mask=None,  # 已过滤 padding + 无效动作，不需要 mask
+                fidelity_mask=fidelity_mask_b,
             )
 
             # ── 4g. Backward（梯度累加）────────────────────────────────────────
@@ -544,8 +559,8 @@ class InfoskillTrainer:
         Compute GroundingDecoder loss for a capped subset of active records.
         Uses the skill's 'title: principle' text as reconstruction target.
         """
-        # Cap at 16 samples to keep memory usage predictable
-        sample = records[:16]
+        # 随机抽 ≤16 条，避免"总取前几条"的偏置；cap 控显存
+        sample = random.sample(records, min(16, len(records)))
 
         z_batch  = torch.stack([r.z_tilde   for r in sample], dim=0).to(self.device)
         s_batch  = torch.stack([r.state_emb for r in sample], dim=0).to(self.device)
