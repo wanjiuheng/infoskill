@@ -64,11 +64,22 @@ def run_eval(
     # Skill is task-level → same grounding_text re-embedded every step; cache it
     skill_emb_cache: Dict[str, torch.Tensor] = {}
 
+    # Reuse one env across episodes: AlfworldTextEnv.reseed switches the task
+    # in-memory, avoiding re-initialising ALFWorld (re-scanning game dirs)
+    # every episode. seed = ep_idx, matching the old factory's counter.
+    env = env_factory()
+    reuse_env = hasattr(env, "reseed")
+
     with torch.no_grad():
         pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
         for ep_idx in pbar:
             ep_start = time.time()
-            env = env_factory()
+            if ep_idx > 0:
+                if reuse_env:
+                    env.reseed(ep_idx)
+                else:
+                    env.close()
+                    env = env_factory()
             obs, info = env.reset()
             task_type = info["task_type"]
             history: List = []
@@ -218,7 +229,6 @@ def run_eval(
                     break
 
             results[task_type].append(won)
-            env.close()
 
             ep_time = time.time() - ep_start
             step_time = ep_time / max(steps, 1)
@@ -235,6 +245,8 @@ def run_eval(
                 ep_idx + 1, n_episodes, task_type, won, steps,
                 ep_time, step_time, running_sr, elapsed_total, eta,
             )
+
+    env.close()
 
     # Compute metrics
     metrics: Dict[str, float] = {}
