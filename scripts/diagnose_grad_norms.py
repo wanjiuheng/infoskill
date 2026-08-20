@@ -190,8 +190,8 @@ def main():
             "policy":   compute_policy_loss(log_probs_b, adv_b),
             "fidelity": compute_fidelity_loss(pred_adv_b, adv_b),
             "rate":     compute_rate_loss(mu_new, log_var_new, prior_mu_b, prior_logvar_b),
-            # 注意：grounding 用的是 rollout 存的 detached z_tilde → 梯度只进
-            # grounding_decoder，不回传 encoder（诊断会如实显示这一点）
+            # grounding 在 trainer 内部用当前 encoder 重算 z（带梯度）→ 梯度能回传
+            # encoder；诊断会如实显示这一点
             "grounding": trainer._compute_grounding_loss(batch_records),
         }
         for t, v in terms.items():

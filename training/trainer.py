@@ -415,9 +415,11 @@ class InfoskillTrainer:
         advantages_per_ep = compute_grpo_advantages(buf.total_rewards)  # [G]
 
         # 2. 过滤出有效的 records（排除 padding placeholders + 无效动作）
-        #    is_valid=False 表示解析失败（无 <think>/<action> 标签、含中文等），
-        #    生成 token 是乱码/无效输出，不能参与 policy loss——否则成功 episode 里
-        #    的乱码步会被 advantage>0 强化，放训练退化阶段的乱码行为。
+        #    is_valid=False 表示动作无法解析（无 <action> 标签、action 内容为空
+        #    或含中文）——生成 token 是乱码/无效输出，不能参与 policy loss，否则
+        #    成功 episode 里的乱码步会被 advantage>0 强化，放大训练退化阶段的
+        #    乱码行为。注意：<think> 缺失或推理里带中文不判无效（那是真实执行过
+        #    的动作，见 utils/action_parser.py）。
         active_records: List[StepRecord] = [
             r for r in buf.records if not r.is_padding and r.is_valid
         ]
@@ -436,10 +438,6 @@ class InfoskillTrainer:
         # 压缩正则、与方差无关，照常计算）。
         rewards_t = torch.as_tensor(buf.total_rewards, dtype=torch.float32)
         zero_variance_group = bool(rewards_t.std(unbiased=False) < 1e-6)
-
-        # Grounding loss：每轮从整组有效记录里随机抽 ≤16 条算一次。辅助项不逐
-        # mini-batch 算（省显存），随机抽样避免"总取每组开头几条"的系统偏置。
-        grounding_loss_scalar = self._compute_grounding_loss(active_records)
 
         # 3. Prepare advantage tensor broadcast to each step
         adv_list = [advantages_per_ep[r.ep_idx] for r in active_records]
@@ -496,7 +494,15 @@ class InfoskillTrainer:
             prior_mu_b, prior_logvar_b = self.prior_net(state_embs_b)  # [B, L]
             pred_advantage_b = self.reward_predictor(z_tilde_new, state_embs_b)  # [B]
 
-            # ── 4f. 计算 total loss（这个 mini-batch）───────────────────────
+            # ── 4f. Grounding loss（这个 mini-batch）─────────────────────────
+            # 用本 batch 的 encoder 重算 z（带梯度），grounding 梯度能回传
+            # encoder，真正把 z 锚定到 skill 文本。此前用 rollout 存的 detached
+            # z_tilde，梯度只进 GroundingDecoder，grounding 完全不约束 encoder。
+            # 放循环内逐 batch 计算：每个 batch 有独立的计算图，避免共享图在多次
+            # backward 时被释放报错。
+            grounding_loss_b = self._compute_grounding_loss(batch_records)
+
+            # ── 4g. 计算 total loss（这个 mini-batch）───────────────────────
             # fidelity_mask：零方差组的所有步置 0，跳过 fidelity 监督
             fidelity_mask_b = (
                 torch.zeros(B, device=self.device, dtype=torch.float32)
@@ -510,7 +516,7 @@ class InfoskillTrainer:
                 log_var=log_var_new,
                 prior_mu=prior_mu_b,
                 prior_log_var=prior_logvar_b,
-                grounding_loss=grounding_loss_scalar,
+                grounding_loss=grounding_loss_b,
                 alpha1=self.alpha1,
                 alpha2=self.alpha2,
                 beta=self.beta,
@@ -518,7 +524,7 @@ class InfoskillTrainer:
                 fidelity_mask=fidelity_mask_b,
             )
 
-            # ── 4g. Backward（梯度累加）────────────────────────────────────────
+            # ── 4h. Backward（梯度累加）────────────────────────────────────────
             # 注意：不调用 optimizer.zero_grad()，这样梯度会累加到之前的 mini-batch
             total_b.backward()
 
@@ -556,14 +562,22 @@ class InfoskillTrainer:
 
     def _compute_grounding_loss(self, records: List[StepRecord]) -> torch.Tensor:
         """
-        Compute GroundingDecoder loss for a capped subset of active records.
-        Uses the skill's 'title: principle' text as reconstruction target.
+        Compute GroundingDecoder loss for a capped subset of records.
+        Recomputes z from the stored eps with the CURRENT encoder, so the
+        gradient flows back into the encoder (grounding anchors z to the skill
+        text). The rollout-stored z_tilde is detached and would only train the
+        GroundingDecoder.
         """
         # 随机抽 ≤16 条，避免"总取前几条"的偏置；cap 控显存
         sample = random.sample(records, min(16, len(records)))
 
-        z_batch  = torch.stack([r.z_tilde   for r in sample], dim=0).to(self.device)
-        s_batch  = torch.stack([r.state_emb for r in sample], dim=0).to(self.device)
+        s_batch = torch.stack([r.state_emb for r in sample], dim=0).to(self.device)
+        k_batch = torch.stack([r.skill_emb for r in sample], dim=0).to(self.device)
+        eps_batch = torch.stack([r.eps for r in sample], dim=0).to(self.device)
+
+        mu_s, log_var_s = self.encoder(s_batch, k_batch)
+        std_s = torch.exp(0.5 * log_var_s)
+        z_tilde_s = mu_s + std_s * eps_batch   # [B, latent_dim], 梯度 → encoder
 
         # Tokenise grounding targets (skill texts)
         skill_texts = [r.skill_text for r in sample]
@@ -575,7 +589,7 @@ class InfoskillTrainer:
             max_length=self.cfg.get("fast", {}).get("grounding_max_len", 64),
         ).to(self.device)
 
-        return self.grounding_decoder(z_batch, s_batch, target_ids=enc.input_ids)
+        return self.grounding_decoder(z_tilde_s, s_batch, target_ids=enc.input_ids)
 
     def _recompute_log_probs_batch(
         self,
