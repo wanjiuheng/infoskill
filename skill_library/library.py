@@ -129,6 +129,15 @@ class SkillLibrary:
 
         print(f"[SkillLibrary] Loaded {len(self._skills)} skills from {path}")
 
+    def load(self, path: str) -> None:
+        """
+        用 path 中的技能库替换当前库（resume 恢复用）。
+        清空现有技能，重载 checkpoint 的 skills.json 并重建 embedding cache。
+        """
+        self._skills = []
+        self._load(path)
+        self._build_embedding_cache()
+
     def save(self, path: Optional[str] = None) -> None:
         """Persist current skill set back to JSON."""
         out_path = path or self._json_path
@@ -279,17 +288,9 @@ class SkillLibrary:
         new_skill = Skill(skill_dict, category=category)
         self._skills.append(new_skill)
 
-        # Enforce hard cap: remove oldest dynamic skills (non-seed) if needed
-        if len(self._skills) > self.max_skills:
-            # Find oldest non-seed skill (dynamic IDs start with "dyn_")
-            for i, s in enumerate(self._skills):
-                if s.skill_id.startswith("dyn_"):
-                    self._skills.pop(i)
-                    break
-            else:
-                # All seeds: remove the earliest entry overall
-                self._skills.pop(0)
-
+        # 容量上限统一由 prune() 按 MIG 末位淘汰处理（库超过 max_skills 时
+        # 定期触发），这里不做即时删除——否则库永远停在 max_skills，prune 的
+        # MIG 排序淘汰逻辑永远不会执行。
         self._invalidate_cache()
         return True
 
@@ -372,7 +373,10 @@ class SkillLibrary:
         min_uses: int = 5,
     ) -> List[str]:
         """
-        Slow Module: remove skills with MIG ≤ 0.
+        Slow Module: 库超过 max_skills 时才触发末位淘汰（按 MIG 升序）。
+
+        未使用或使用不足 min_uses 的技能无法可靠评估 MIG，记为 +inf（优先
+        保留），避免训练早期模型未收敛时误删 seed 技能。
 
         Args:
             usage_history: Dict mapping skill_id → (state_embs, advantages).
@@ -381,24 +385,44 @@ class SkillLibrary:
         Returns:
             List of pruned skill_ids.
         """
-        pruned = []
-        for skill in list(self._skills):
-            if skill.skill_id not in usage_history:
+        if len(self._skills) <= self.max_skills:
+            return []  # 库没满，不触发剪枝
+
+        # 评估每个技能的 MIG；无数据/数据不足的技能 MIG=+inf（最后才删）
+        scored: List[Tuple[float, int, Skill]] = []
+        for idx, skill in enumerate(self._skills):
+            entries = usage_history.get(skill.skill_id)
+            if entries is None:
+                scored.append((float("inf"), idx, skill))
                 continue
-            state_embs, advs = usage_history[skill.skill_id]
+            state_embs, advs = entries
             if len(state_embs) < min_uses:
+                scored.append((float("inf"), idx, skill))
                 continue
             mig = self.evaluate_mig(
                 skill, encoder, prior_net, reward_predictor,
                 state_embs, advs, beta=beta,
             )
-            if mig <= 0.0:
-                self.remove_skill(skill.skill_id)
-                pruned.append(skill.skill_id)
+            scored.append((mig, idx, skill))
+
+        # MIG 升序：最没用的排最前优先删。第二个 key 用原始序号，避免 inf 并列
+        # 时 Python 回退到比较 Skill 对象（未定义 <）而抛 TypeError。
+        scored.sort(key=lambda x: (x[0], x[1]))
+
+        n_remove = len(self._skills) - self.max_skills
+        remove_ids = set()
+        for mig, _, skill in scored[:n_remove]:
+            if mig == float("inf"):
+                print(f"[SkillLibrary] Pruned unused skill {skill.skill_id!r}: {skill.title!r}")
+            else:
                 print(f"[SkillLibrary] Pruned skill {skill.skill_id!r} "
                       f"(MIG={mig:.4f}): {skill.title!r}")
+            remove_ids.add(skill.skill_id)
 
-        return pruned
+        # 批量删除，只重建一次 embedding cache
+        self._skills = [s for s in self._skills if s.skill_id not in remove_ids]
+        self._invalidate_cache()
+        return list(remove_ids)
 
     # ── Properties ────────────────────────────────────────────────────────────
 

@@ -20,7 +20,6 @@ Slow loop  (every T global steps):
 
 from __future__ import annotations
 
-import csv
 import os
 import json
 import logging
@@ -120,6 +119,7 @@ class InfoskillTrainer:
         self.slow_interval   = tcfg.get("slow_update_interval", 200)
         self.success_thresh  = tcfg.get("success_threshold", 0.8)
         self.skill_gen_batch = slcfg.get("skill_gen_batch", 5)
+        self.success_reward_threshold = slcfg.get("success_reward_threshold", 5.0)
         self.checkpoint_dir  = cfg.get("paths", {}).get("checkpoint_dir", "checkpoints")
         self.save_freq       = tcfg.get("save_freq", 100)
         self.eval_freq       = tcfg.get("eval_freq", 50)
@@ -253,6 +253,7 @@ class InfoskillTrainer:
                 device=self.device,
                 cfg=self.cfg.get("rollout", {}),
                 action_logger=self.action_logger,  # Pass action logger to rollout
+                success_reward_threshold=self.success_reward_threshold,
             )
             buf: TrajectoryBuffer = collector.collect()
 
@@ -730,13 +731,9 @@ class InfoskillTrainer:
                 if added:
                     logger.info("Slow Module: added new skill %r", new_skill.get("title"))
 
-        # ── 3. Persist ────────────────────────────────────────────────────────
-        save_path = os.path.join(
-            self.checkpoint_dir,
-            f"skills_step{self._global_step}.json"
-        )
-        self.skill_lib.save(save_path)
-
+        # 技能库快照不再单独存 skills_step<N>.json —— 由 save_checkpoint 每
+        # save_freq 个 episode 统一落盘（ep<N>/skills.json），load_checkpoint
+        # 时恢复，避免冗余存档。
         self.encoder.train()
         self.prior_net.train()
         self.reward_predictor.train()
@@ -827,32 +824,25 @@ class InfoskillTrainer:
         self._next_save_ep   = (self._episode_count // self.save_freq + 1) * self.save_freq
         self._next_eval_ep   = (self._episode_count // self.eval_freq + 1) * self.eval_freq
         self._next_slow_step = (self._global_step // self.slow_interval + 1) * self.slow_interval
+
+        # 恢复技能库：续训要接上之前的技能积累，否则从初始 seed 重新开始
+        skills_path = os.path.join(path, "skills.json")
+        if os.path.exists(skills_path):
+            self.skill_lib.load(skills_path)
+            logger.info("Loaded skill library from %s (%d skills)",
+                        skills_path, len(self.skill_lib))
+        else:
+            logger.warning("No skills.json in %s — keeping current library", path)
+
         logger.info("Loaded checkpoint from %s (episode %d)", path, self._episode_count)
 
     def _save_metrics_plot(self) -> None:
         """
-        保存训练指标曲线图和 CSV 文件。
-        每个 group 后调用，覆盖写 loss_curve.png 和追加写 metrics.csv。
+        保存训练指标曲线图（loss_curve.png）。
+        每个 group 后调用，覆盖写 PNG；CSV 由 _save_metrics_csv 负责。
         """
         if not self._metrics_history:
             return
-
-        os.makedirs(self._log_dir, exist_ok=True)
-
-        # ── Save CSV (追加模式，第一次写表头) ────────────────────────────────
-        csv_path = os.path.join(self._log_dir, "metrics.csv")
-        file_exists = os.path.exists(csv_path)
-
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            fieldnames = [
-                "episode", "group", "success_rate", "avg_steps", "total_loss",
-                "policy_loss", "fidelity_loss", "rate_loss", "grounding_loss", "num_skills"
-            ]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-            # 只写最后一条（当前 group 的 metrics）
-            writer.writerow(self._metrics_history[-1])
 
         # ── Plot curves (覆盖写 PNG) ──────────────────────────────────────────
         try:

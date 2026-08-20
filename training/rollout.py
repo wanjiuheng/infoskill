@@ -123,6 +123,7 @@ class GroupRolloutCollector:
         device:     torch.device,
         cfg:        Dict[str, Any],
         action_logger = None,  # Optional logger for recording actions
+        success_reward_threshold: float = 5.0,  # skill_library.success_reward_threshold
     ) -> None:
         self.envs       = envs
         self.model      = model
@@ -133,6 +134,7 @@ class GroupRolloutCollector:
         self.device     = device
         self.G          = len(envs)
         self.action_logger = action_logger
+        self.success_reward_threshold = success_reward_threshold
 
         self.max_steps       = cfg.get("max_steps", 50)
         self.max_new_tokens  = cfg.get("max_new_tokens", 128)
@@ -338,10 +340,9 @@ class GroupRolloutCollector:
         )
 
         # Collect successful trajectories for Slow Module
-        # 训练早期：放宽到 ≤50 步成功都收集（reward ≥ 5.0）
-        # 后期可提高到 7.0（≤30 步）或 8.0（≤20 步）
+        # 阈值来自 skill_library.success_reward_threshold（configs/alfworld.yaml）
         for i in range(self.G):
-            if ep_rewards[i] >= 5.0:
+            if ep_rewards[i] >= self.success_reward_threshold:
                 buf.success_trajectories.append({
                     "task": buf.task_info_per_episode[i]["task_description"],
                     "task_type": buf.task_info_per_episode[i]["task_type"],

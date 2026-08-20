@@ -72,6 +72,9 @@ skill_library:
   top_k_task: 3               # number of task-specific skills to retrieve per step
   max_skills: 200             # hard cap on library size
   skill_gen_batch: 5          # trajectories fed to Qwen per skill-generation call
+  success_reward_threshold: 7.0  # reward >= 此值的成功轨迹才收集去生成新技能
+                                  # reward = 10.0 - 0.1*step_count，7.0 对应 ≤30 步
+                                  # （与 rollout.max_steps=30 对齐）；之前是 5.0（≤50 步）
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device: "cuda"

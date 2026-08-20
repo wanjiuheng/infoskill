@@ -132,7 +132,7 @@ def main():
 
     # ── Trainer proxy (only the fields run_eval accesses) ─────────────────────
     trainer = types.SimpleNamespace(
-        model=model,
+        _base_model=model,  # run_eval 用 trainer._base_model 解包模型
         tokenizer=tokenizer,
         encoder=encoder,
         projector=projector,
