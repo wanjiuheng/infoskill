@@ -34,7 +34,7 @@ loss:
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
   group_size: 4               # G: parallel episodes per task
-  max_steps: 50               # max steps per episode
+  max_steps: 30                # max steps per episode
   max_new_tokens: 512         # LLM generation budget per step
   temperature: 0.9
   top_p: 0.9
@@ -43,7 +43,10 @@ rollout:
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
   num_episodes: 14212          # total episodes (3553 games × 4)
-  learning_rate: 1.0e-4        # NOTE: PyYAML parses "1e-4" (no decimal point) as a
+  learning_rate: 1.0e-6        # 从 1e-4 改为论文值 1e-6——1e-4 比论文大 100 倍，
+                                # 疑似是训练崩溃（loss/success_rate/skills 归零，
+                                # LLM 输出退化为中日文/乱码）的主因，待验证。
+                                # NOTE: PyYAML parses "1e-4" (no decimal point) as a
                                 # string, not a float — always write "1.0e-4" style.
   grad_clip: 1.0
   batch_accumulation: 1
