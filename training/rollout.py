@@ -144,6 +144,10 @@ class GroupRolloutCollector:
         self.top_p           = cfg.get("top_p", 0.9)
         self.history_len     = cfg.get("history_len", 3)
 
+        # Skill embedding cache: grounding_text → [D]. Skill is task-level, so
+        # the same skill text is re-embedded every step; cache avoids that.
+        self._skill_emb_cache: Dict[str, torch.Tensor] = {}
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def collect(self) -> TrajectoryBuffer:
@@ -381,11 +385,14 @@ class GroupRolloutCollector:
                 task_type=info_list[i].get("task_type"),
             )
             skill_texts.append(skill.grounding_text)
-            emb = get_text_embedding(
-                skill.grounding_text, self.model, self.tokenizer, self.device
-            )
-            if emb.dim() == 2:
-                emb = emb.squeeze(0)
+            emb = self._skill_emb_cache.get(skill.grounding_text)
+            if emb is None:
+                emb = get_text_embedding(
+                    skill.grounding_text, self.model, self.tokenizer, self.device
+                )
+                if emb.dim() == 2:
+                    emb = emb.squeeze(0)
+                self._skill_emb_cache[skill.grounding_text] = emb
             skill_embs.append(emb)
         return skill_texts, skill_embs
 

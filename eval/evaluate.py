@@ -61,6 +61,9 @@ def run_eval(
     results: Dict[str, List[bool]] = defaultdict(list)
     eval_start = time.time()
 
+    # Skill is task-level → same grounding_text re-embedded every step; cache it
+    skill_emb_cache: Dict[str, torch.Tensor] = {}
+
     with torch.no_grad():
         pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
         for ep_idx in pbar:
@@ -94,11 +97,14 @@ def run_eval(
                 state_emb = get_text_embedding(obs, model, tokenizer, device)  # [D]
                 if state_emb.dim() == 1:
                     state_emb = state_emb.unsqueeze(0)                          # [1, D]
-                skill_emb = get_text_embedding(
-                    skill.grounding_text, model, tokenizer, device
-                )
-                if skill_emb.dim() == 1:
-                    skill_emb = skill_emb.unsqueeze(0)
+                skill_emb = skill_emb_cache.get(skill.grounding_text)
+                if skill_emb is None:
+                    skill_emb = get_text_embedding(
+                        skill.grounding_text, model, tokenizer, device
+                    )
+                    if skill_emb.dim() == 1:
+                        skill_emb = skill_emb.unsqueeze(0)
+                    skill_emb_cache[skill.grounding_text] = skill_emb
 
                 # Encode → soft prefix
                 mu, log_var = encoder(state_emb, skill_emb)

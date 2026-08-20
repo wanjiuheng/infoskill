@@ -20,6 +20,7 @@ import json
 import os
 import re
 import uuid
+from collections import OrderedDict
 from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
@@ -103,6 +104,13 @@ class SkillLibrary:
         # Embedding cache: [N, hidden_size] tensor (row i ↔ self._skills[i])
         self._embeddings: Optional[torch.Tensor] = None
 
+        # Retrieve-result cache: (query_text, task_type) → (gen, task). Skill
+        # selection is task-level (fixed per episode), so the same query is
+        # re-embedded every step; this avoids recomputing the query embedding
+        # and similarity ranking. Cleared whenever the skill bank changes.
+        self._retrieve_cache: "OrderedDict" = OrderedDict()
+        self._retrieve_cache_cap = 64
+
         self._load(json_path)
         self._build_embedding_cache()
 
@@ -162,6 +170,8 @@ class SkillLibrary:
     @torch.no_grad()
     def _build_embedding_cache(self) -> None:
         """(Re)compute embeddings for all skills using get_text_embedding()."""
+        # Skill bank changed → similarity scores change → stale retrieve hits
+        self._retrieve_cache.clear()
         texts = [s.grounding_text for s in self._skills]
         if not texts:
             self._embeddings = torch.zeros(
@@ -210,6 +220,13 @@ class SkillLibrary:
         if self._embeddings is None or len(self._skills) == 0:
             return [], []
 
+        # Task-level skills are fixed per episode → same query every step. Hit
+        # the cache (if present) to skip re-embedding and re-ranking.
+        key = (query_text, task_type)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
         # Embed the query
         q_emb = get_text_embedding(
             query_text, self._model, self._tokenizer, self._device
@@ -242,7 +259,27 @@ class SkillLibrary:
                 if s.category not in ("general", "mistake")
             ]
         task_skills = topk(task_idxs, self.top_k_task)
+        self._cache_put(key, gen_skills, task_skills)
         return gen_skills, task_skills
+
+    def _cache_get(self, key: Tuple[str, Optional[str]]):
+        if key in self._retrieve_cache:
+            self._retrieve_cache.move_to_end(key)
+            gen, task = self._retrieve_cache[key]
+            return list(gen), list(task)
+        return None
+
+    def _cache_put(
+        self,
+        key:          Tuple[str, Optional[str]],
+        gen_skills:   List[Skill],
+        task_skills:  List[Skill],
+    ) -> None:
+        # Store tuples so callers mutating the returned lists cannot poison the cache.
+        self._retrieve_cache[key] = (tuple(gen_skills), tuple(task_skills))
+        self._retrieve_cache.move_to_end(key)
+        while len(self._retrieve_cache) > self._retrieve_cache_cap:
+            self._retrieve_cache.popitem(last=False)
 
     def format_for_prompt(
         self,
