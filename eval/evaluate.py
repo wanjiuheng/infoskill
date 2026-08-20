@@ -22,6 +22,10 @@ from models.encoder import sample_z
 
 logger = logging.getLogger(__name__)
 
+# 无放回 eval 用的固定顺序种子：eval 开始时只打乱一次 game 顺序，之后连续
+# reset 按序遍历整个 game 池（不重复不遗漏），固定值保证每次 eval 可复现。
+EVAL_ORDER_SEED = 1234
+
 
 def run_eval(
     trainer,               # InfoskillTrainer instance
@@ -66,20 +70,33 @@ def run_eval(
 
     # Reuse one env across episodes: AlfworldTextEnv.reseed switches the task
     # in-memory, avoiding re-initialising ALFWorld (re-scanning game dirs)
-    # every episode. seed = ep_idx, matching the old factory's counter.
+    # every episode.
     env = env_factory()
     reuse_env = hasattr(env, "reseed")
+
+    # ── 无放回全量覆盖 ──────────────────────────────────────────────────────
+    # TextWorld 的 shuffled_cycle 迭代器第一轮按 seed 洗牌后的顺序逐个 yield、
+    # 不重复，只有耗尽后才重洗。所以 eval 开始时用固定 seed 打乱一次顺序，
+    # 之后每 episode 直接连续 reset()，即天然无放回遍历整个 game 池。
+    # 旧实现每 episode reseed(ep_idx) 是"有放回随机抽样"（每次从新洗牌的列表
+    # 取第一个），会重复、无法保证覆盖全部 game。
+    pool_size = getattr(env, "num_games", None)
+    if pool_size and n_episodes > pool_size:
+        logger.warning(
+            "n_episodes=%d 超过 game 池大小 %d，已截断为 pool 大小（无放回上限）",
+            n_episodes, pool_size,
+        )
+        n_episodes = pool_size
+    if reuse_env:
+        env.reseed(EVAL_ORDER_SEED)   # 固定打乱一次顺序，保证可复现
 
     with torch.no_grad():
         pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
         for ep_idx in pbar:
             ep_start = time.time()
-            if ep_idx > 0:
-                if reuse_env:
-                    env.reseed(ep_idx)
-                else:
-                    env.close()
-                    env = env_factory()
+            if ep_idx > 0 and not reuse_env:
+                env.close()
+                env = env_factory()
             obs, info = env.reset()
             task_type = info["task_type"]
             history: List = []

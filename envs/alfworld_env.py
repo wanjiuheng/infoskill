@@ -20,6 +20,19 @@ from typing import Tuple, Dict, Any, List, Optional
 from envs.base import BaseEnvWrapper
 
 
+# 细粒度 ALFWorld 任务类型 → 论文粗粒度 6 类。细粒度类型 = 任务目录前缀 =
+# traj_data.task_type，AlfredTWEnv 收集 game 时即确定，无需从目标句关键词猜。
+# movable_recep 不在其中：TextWorld 数据里无可玩 game，原版 collect_game_files 跳过。
+COARSE_TYPE_MAP = {
+    "look_at_obj_in_light":            "look_at_obj_in_light",
+    "pick_and_place_simple":           "pick_and_place",
+    "pick_clean_then_place_in_recep":  "clean",
+    "pick_heat_then_place_in_recep":   "heat",
+    "pick_cool_then_place_in_recep":   "cool",
+    "pick_two_obj_and_place":          "examine",
+}
+
+
 def detect_task_type(task_description: str) -> str:
     """
     Detect the ALFWorld task category from the goal sentence.
@@ -68,6 +81,7 @@ class AlfworldTextEnv(BaseEnvWrapper):
 
         self._env = None          # lazy-initialised TextWorld gym env
         self._task_desc: str = ""
+        self._task_type: str = "pick_and_place"
         self._step_count: int = 0
 
         self._init_env()
@@ -112,6 +126,13 @@ class AlfworldTextEnv(BaseEnvWrapper):
         self._seed = new_seed
         self._real_seed_fn(new_seed)
 
+    @property
+    def num_games(self) -> int:
+        """底层 TextWorld game 池大小（无放回 eval 的覆盖上限）。"""
+        if self._env is None:
+            return 0
+        return len(getattr(self._env, "gamefiles", []) or [])
+
     def close(self) -> None:
         if self._env is not None:
             try:
@@ -138,11 +159,12 @@ class AlfworldTextEnv(BaseEnvWrapper):
         # Extract task description from the first observation or infos
         # ALFWorld prepends "Your task is to: ..." in the first obs
         self._task_desc = self._extract_task(obs_text, infos)
+        self._task_type = self._real_task_type(infos, self._task_desc)
 
         admissible: List[str] = self._get_admissible(infos)
         info = {
             "task_description":    self._task_desc,
-            "task_type":           detect_task_type(self._task_desc),
+            "task_type":           self._task_type,
             "admissible_commands": admissible,
             "won":                 False,
             "done":                False,
@@ -177,7 +199,7 @@ class AlfworldTextEnv(BaseEnvWrapper):
         admissible: List[str] = self._get_admissible(infos)
         info = {
             "task_description":    self._task_desc,
-            "task_type":           detect_task_type(self._task_desc),
+            "task_type":           self._task_type,
             "admissible_commands": admissible,
             "won":                 won,
             "done":                done,
@@ -192,6 +214,29 @@ class AlfworldTextEnv(BaseEnvWrapper):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _gamefile_path(infos: Dict) -> str:
+        """当前游戏文件路径（AlfredInfos 在 reset 时写入 extra.gamefile）。"""
+        gf = infos.get("extra.gamefile", [""])[0] if isinstance(
+            infos.get("extra.gamefile", ""), list) else infos.get("extra.gamefile", "")
+        return str(gf) if gf else ""
+
+    @staticmethod
+    def _real_task_type(infos: Dict, task_desc: str) -> str:
+        """
+        当前任务在论文 6 类中的真实类型。
+
+        从游戏路径 .../{task_dir}/{trial}/game.tw-pddl 解析任务目录名，取前缀
+        （细粒度类型）映射到粗粒度 6 类；路径不可用时才回退到关键词检测。
+        """
+        gf = AlfworldTextEnv._gamefile_path(infos)
+        for cand in (os.path.basename(os.path.dirname(os.path.dirname(gf))) if gf else "",
+                     os.path.basename(gf) if gf else ""):
+            fine = cand.split("-")[0]
+            if fine in COARSE_TYPE_MAP:
+                return COARSE_TYPE_MAP[fine]
+        return detect_task_type(task_desc)
+
+    @staticmethod
     def _extract_task(obs_text: str, infos: Dict) -> str:
         """Pull the task goal sentence from the initial observation."""
         # Pattern: "Your task is to: <goal>."
@@ -199,8 +244,7 @@ class AlfworldTextEnv(BaseEnvWrapper):
         if match:
             return match.group(1).strip()
         # Fallback: use the gamefile path tail if available
-        gamefile = infos.get("extra.gamefile", [""])[0] if isinstance(
-            infos.get("extra.gamefile", ""), list) else infos.get("extra.gamefile", "")
+        gamefile = AlfworldTextEnv._gamefile_path(infos)
         if gamefile:
             return os.path.basename(os.path.dirname(str(gamefile)))
         return obs_text[:120]   # last resort: truncate raw obs
