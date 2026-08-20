@@ -54,7 +54,6 @@ training:
 
   # Slow module
   slow_update_interval: 3   # T: steps between library maintenance runs
-  success_threshold: 0.8      # episode reward threshold to trigger skill generation
   mig_beta: 0.001             # beta used in MIG = Fidelity - beta*Rate for pruning
 
   # Checkpointing

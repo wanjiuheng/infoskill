@@ -117,7 +117,6 @@ class InfoskillTrainer:
         self.mig_beta = tcfg.get("mig_beta", 0.001)
         self.grad_clip = tcfg.get("grad_clip", 1.0)
         self.slow_interval   = tcfg.get("slow_update_interval", 200)
-        self.success_thresh  = tcfg.get("success_threshold", 0.8)
         self.skill_gen_batch = slcfg.get("skill_gen_batch", 5)
         self.success_reward_threshold = slcfg.get("success_reward_threshold", 5.0)
         self.checkpoint_dir  = cfg.get("paths", {}).get("checkpoint_dir", "checkpoints")
