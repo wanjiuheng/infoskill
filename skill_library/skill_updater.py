@@ -15,7 +15,7 @@ from typing import List, Dict, Optional
 
 # ── Prompt template ───────────────────────────────────────────────────────────
 
-_SKILL_GEN_PROMPT = """You are an expert at summarising agent experience into reusable skills.
+_SKILL_GEN_PROMPT = """You are an expert at distilling agent experience into reusable, policy-facing skills.
 
 Below are {n} successful trajectories for the task type "{task_type}".
 Each trajectory is a sequence of (observation → action) pairs that led to success.
@@ -25,11 +25,13 @@ Each trajectory is a sequence of (observation → action) pairs that led to succ
 Based on these successes, write ONE new reusable skill in JSON format:
 {{
   "title":         "<short imperative phrase, ≤8 words>",
-  "principle":     "<one-to-two sentence description of the strategy>",
+  "principle":     "<one-to-two sentence policy: the core decision rule / action ordering that made these trajectories work>",
   "when_to_apply": "<one sentence describing the trigger condition>"
 }}
 
-Output ONLY the JSON object, nothing else.
+Constraints:
+- Write "principle" as an actionable rule the agent can follow, NOT a retrospective summary of what happened.
+- Output ONLY the JSON object, nothing else.
 """
 
 
