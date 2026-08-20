@@ -86,7 +86,9 @@ def run_eval(
             for step in range(max_steps):
                 steps += 1
                 # Retrieve skill
-                skill = skill_lib.retrieve_for_encoder(info["task_description"])
+                skill = skill_lib.retrieve_for_encoder(
+                    info["task_description"], task_type=info["task_type"]
+                )
 
                 # Embed
                 state_emb = get_text_embedding(obs, model, tokenizer, device)  # [D]
@@ -228,7 +230,7 @@ def run_eval(
     metrics: Dict[str, float] = {}
     all_results: List[bool] = []
 
-    # 按照 6 个任务类型的顺序输出（与 _TASK_TYPE_KEYWORDS 一致）
+    # 按照 6 个任务类型的顺序输出
     TASK_ORDER = [
         "pick_and_place",
         "look_at_obj_in_light",

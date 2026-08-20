@@ -78,8 +78,7 @@ class SkillLibrary:
         model:           LLM model instance (for embedding).
         tokenizer:       Matching tokenizer.
         device:          Compute device.
-        top_k_general:   Number of general skills to inject per step.
-        top_k_task:      Number of task-specific skills to inject per step.
+        top_k_task:      Number of task-specific skills to inject per step (K).
         max_skills:      Hard cap on total skills (oldest surplus removed).
     """
 
@@ -89,14 +88,12 @@ class SkillLibrary:
         model,
         tokenizer,
         device:        torch.device,
-        top_k_general: int = 3,
-        top_k_task:    int = 3,
+        top_k_task:    int = 6,
         max_skills:    int = 200,
     ) -> None:
         self._model     = model
         self._tokenizer = tokenizer
         self._device    = device
-        self.top_k_general = top_k_general
         self.top_k_task    = top_k_task
         self.max_skills    = max_skills
         self._json_path    = json_path
@@ -195,15 +192,20 @@ class SkillLibrary:
         task_type:  Optional[str] = None,
     ) -> Tuple[List[Skill], List[Skill]]:
         """
-        Retrieve the most relevant general and task-specific skills for a step.
+        Retrieve skills for a step, mirroring SkillRL.
+
+        General skills are always returned in full (foundational guidance);
+        task-specific skills are the top-K most similar within the detected
+        task_type category (K = top_k_task). If the category is empty or
+        task_type is unknown, fall back to cross-category top-K.
 
         Args:
             query_text: Typically the task description string.
-            task_type:  Optional task category (e.g. "heat") to boost task-specific
-                        skills from that category in the ranking.
+            task_type:  Detected task category (e.g. "heat") used to restrict
+                        the task-specific candidate pool.
 
         Returns:
-            (general_skills, task_skills): Each a list of top-k Skill objects.
+            (general_skills, task_skills): general in library order, task top-K.
         """
         if self._embeddings is None or len(self._skills) == 0:
             return [], []
@@ -218,12 +220,6 @@ class SkillLibrary:
         # Cosine similarities [1, N] → [N]
         sims = cosine_similarity_matrix(q_emb, self._embeddings).squeeze(0)
 
-        # Separate indices by category
-        general_idxs  = [i for i, s in enumerate(self._skills) if s.category == "general"]
-        task_idxs     = [i for i, s in enumerate(self._skills)
-                         if s.category not in ("general", "mistake")]
-        # mistakes are never retrieved at runtime (only used for prompt flavour)
-
         def topk(idxs, k):
             if not idxs:
                 return []
@@ -232,8 +228,20 @@ class SkillLibrary:
             top = scores.topk(min(k, len(idxs))).indices
             return [self._skills[idxs[i]] for i in top.tolist()]
 
-        gen_skills  = topk(general_idxs, self.top_k_general)
-        task_skills = topk(task_idxs,    self.top_k_task)
+        # General: always included in full, kept in library order for stability
+        gen_skills = [s for s in self._skills if s.category == "general"]
+
+        # Task-specific: restrict to the detected category (empty/unknown → fallback)
+        task_idxs = (
+            [i for i, s in enumerate(self._skills) if s.category == task_type]
+            if task_type is not None else []
+        )
+        if not task_idxs:
+            task_idxs = [
+                i for i, s in enumerate(self._skills)
+                if s.category not in ("general", "mistake")
+            ]
+        task_skills = topk(task_idxs, self.top_k_task)
         return gen_skills, task_skills
 
     def format_for_prompt(
@@ -258,12 +266,17 @@ class SkillLibrary:
     # ── Skill for Encoder (single best match) ─────────────────────────────────
 
     @torch.no_grad()
-    def retrieve_for_encoder(self, query_text: str) -> Skill:
+    def retrieve_for_encoder(
+        self,
+        query_text: str,
+        task_type:  Optional[str] = None,
+    ) -> Skill:
         """
-        Return the single most-similar skill for feeding into the Encoder.
-        Falls back to the first skill if the library is empty.
+        Return the single best task-specific skill (within task_type) for
+        feeding into the Encoder. Falls back to the first skill if the
+        library is empty.
         """
-        gen, task = self.retrieve(query_text)
+        gen, task = self.retrieve(query_text, task_type=task_type)
         all_retrieved = task + gen   # task-specific first
         if all_retrieved:
             return all_retrieved[0]

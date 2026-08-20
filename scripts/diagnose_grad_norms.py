@@ -78,7 +78,6 @@ def main():
     skill_lib = SkillLibrary(
         json_path=cfg["paths"]["skills_json"],
         model=model, tokenizer=tokenizer, device=device,
-        top_k_general=cfg["skill_library"]["top_k_general"],
         top_k_task=cfg["skill_library"]["top_k_task"],
         max_skills=cfg["skill_library"]["max_skills"],
     )

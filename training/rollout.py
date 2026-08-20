@@ -377,7 +377,8 @@ class GroupRolloutCollector:
         skill_embs  = []
         for i in active_indices:
             skill = self.skill_lib.retrieve_for_encoder(
-                info_list[i]["task_description"]
+                info_list[i]["task_description"],
+                task_type=info_list[i].get("task_type"),
             )
             skill_texts.append(skill.grounding_text)
             emb = get_text_embedding(

@@ -20,24 +20,27 @@ from typing import Tuple, Dict, Any, List, Optional
 from envs.base import BaseEnvWrapper
 
 
-# ── Task-type keyword map (mirrors SkillRL's _detect_task_type) ───────────────
-_TASK_TYPE_KEYWORDS: Dict[str, List[str]] = {
-    "pick_and_place":      ["pick", "put", "place"],
-    "look_at_obj_in_light":["examine", "look", "light"],
-    "clean":               ["clean", "wash", "rinse"],
-    "heat":                ["heat", "microwave", "warm"],
-    "cool":                ["cool", "fridge", "refrigerator"],
-    "examine":             ["examine", "study", "inspect"],
-}
-
-
 def detect_task_type(task_description: str) -> str:
-    """Keyword-based task category detection (used for skill retrieval routing)."""
-    desc = task_description.lower()
-    for task_type, keywords in _TASK_TYPE_KEYWORDS.items():
-        if any(kw in desc for kw in keywords):
-            return task_type
-    return "pick_and_place"   # safe default
+    """
+    Detect the ALFWorld task category from the goal sentence.
+
+    Mirrors SkillRL's `_detect_task_type` keyword chain exactly:
+    look_at_obj_in_light → clean → heat → cool → examine → pick_and_place.
+    """
+    goal = task_description.lower()
+    if "look at" in goal and "under" in goal:
+        return "look_at_obj_in_light"
+    elif "clean" in goal:
+        return "clean"
+    elif "heat" in goal:
+        return "heat"
+    elif "cool" in goal:
+        return "cool"
+    elif "examine" in goal or "find" in goal:
+        return "examine"
+    elif "put" in goal:
+        return "pick_and_place"
+    return "pick_and_place"   # SkillRL's default
 
 
 class AlfworldTextEnv(BaseEnvWrapper):

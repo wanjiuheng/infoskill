@@ -63,8 +63,8 @@ training:
 
 # ── Skill Library ─────────────────────────────────────────────────────────────
 skill_library:
-  top_k_general: 3            # number of general skills to retrieve per step
-  top_k_task: 3               # number of task-specific skills to retrieve per step
+  top_k_task: 6               # K: task-specific skills retrieved per step (SkillRL K=6)
+                              # general skills are always included in full
   max_skills: 200             # hard cap on library size
   skill_gen_batch: 5          # trajectories fed to Qwen per skill-generation call
 
