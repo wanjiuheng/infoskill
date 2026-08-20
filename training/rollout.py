@@ -29,22 +29,14 @@ logger = logging.getLogger("rollout")
 
 # ── Prompt template ───────────────────────────────────────────────────────────
 
-_STEP_PROMPT = """You are an expert agent operating in the ALFWorld household environment.
-Your task is to: {task_description}
-
-## Retrieved Skill Guidance
+_STEP_PROMPT = """You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+## Retrieved Relevant Experience
 {skill_guidance}
-
-## Action History (last {history_len} steps)
-{history}
-
-## Current Observation
-{obs}
-
-## Admissible Actions
-{admissible}
-
-Reason step-by-step inside <think></think> tags, then output exactly one action inside <action></action> tags.
+## Current Progress
+Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_len} observations and the corresponding actions you took: {history}
+You are now at step {current_step} and your current observation is: {obs}
+Your admissible actions of the current situation are: [{admissible}].
+Now it's your turn to take an action. You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
 """
 
 
@@ -221,7 +213,7 @@ class GroupRolloutCollector:
                 # 5. Build prompts and run LLM.generate() (only for active episodes)
                 actions_raw_active, prompt_ids_active, gen_ids_active, token_counts = self._batch_generate_active(
                     obs_list, info_list, history_list, skill_texts_active,
-                    soft_prefix_active, active_indices,
+                    soft_prefix_active, active_indices, ep_step_count,
                 )
 
                 # Map active results back to full G indices
@@ -294,7 +286,7 @@ class GroupRolloutCollector:
                     next_obs, reward, done, next_info = self.envs[i].step(matched_action)
 
                     ep_rewards[i] += reward
-                    history_list[i].append((obs_list[i], matched_action))
+                    history_list[i].append((ep_step_count[i], obs_list[i], matched_action))
                     if len(history_list[i]) > self.history_len:
                         history_list[i].pop(0)
 
@@ -402,12 +394,17 @@ class GroupRolloutCollector:
         info:       Dict,
         history:    List[Tuple],
         skill_text: str,
+        step_count: int,
     ) -> str:
-        """Render the step prompt string for one episode."""
-        # History: "(step N) obs → action" pairs
+        """Render the step prompt string for one episode.
+
+        step_count: steps already taken before this step (may exceed
+                    len(history), which is window-truncated).
+        """
+        # History: "(step N) obs → action" pairs with absolute step numbers
         hist_lines = []
-        for j, (h_obs, h_act) in enumerate(history, 1):
-            hist_lines.append(f"Step {j}: Obs: {h_obs} → Action: {h_act}")
+        for h_step, h_obs, h_act in history:
+            hist_lines.append(f"Step {h_step}: Obs: {h_obs} → Action: {h_act}")
         history_str = "\n".join(hist_lines) if hist_lines else "(none yet)"
 
         admissible_str = ", ".join(info["admissible_commands"])
@@ -420,11 +417,15 @@ class GroupRolloutCollector:
         if not skill_guidance:
             skill_guidance = f"- {skill_text}"
 
+        current_step = step_count + 1        # this step's number
+
         return _STEP_PROMPT.format(
             task_description=info["task_description"],
             skill_guidance=skill_guidance,
-            history_len=len(history),
+            step_count=step_count,
+            history_len=len(history),        # most recent N shown (window-truncated)
             history=history_str,
+            current_step=current_step,
             obs=obs,
             admissible=admissible_str,
         )
@@ -437,6 +438,7 @@ class GroupRolloutCollector:
         skill_texts:    List[str],
         soft_prefix:    torch.Tensor,   # [n_active, m, hidden]
         active_indices: List[int],
+        ep_step_count:  List[int],
     ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor], List[int]]:
         """
         Run model.generate() only for active episodes with soft_prefix prepended.
@@ -449,7 +451,10 @@ class GroupRolloutCollector:
         """
         n_active = len(active_indices)
         prompts = [
-            self._build_prompt(obs_list[i], info_list[i], history_list[i], skill_texts[idx])
+            self._build_prompt(
+                obs_list[i], info_list[i], history_list[i], skill_texts[idx],
+                ep_step_count[i],
+            )
             for idx, i in enumerate(active_indices)
         ]
 

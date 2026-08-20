@@ -114,19 +114,23 @@ def run_eval(
                 # Build prompt
                 from training.rollout import _STEP_PROMPT
                 hist_lines = [
-                    f"Step {j+1}: Obs: {h_obs} → Action: {h_act}"
-                    for j, (h_obs, h_act) in enumerate(history)
+                    f"Step {h_step}: Obs: {h_obs} → Action: {h_act}"
+                    for h_step, h_obs, h_act in history
                 ]
                 history_str = "\n".join(hist_lines) if hist_lines else "(none yet)"
                 gen_skills, task_skills = skill_lib.retrieve(
                     info["task_description"], task_type=task_type
                 )
                 skill_guidance = skill_lib.format_for_prompt(gen_skills, task_skills)
+                step_count   = steps - 1             # steps already taken before this one
+                current_step = steps                 # this step's number
                 prompt = _STEP_PROMPT.format(
                     task_description=info["task_description"],
                     skill_guidance=skill_guidance or f"- {skill.grounding_text}",
-                    history_len=len(history),
+                    step_count=step_count,
+                    history_len=len(history),        # most recent N shown (window-truncated)
                     history=history_str,
+                    current_step=current_step,
                     obs=obs,
                     admissible=", ".join(info["admissible_commands"]),
                 )
@@ -196,7 +200,7 @@ def run_eval(
                         ep_idx + 1, step + 1, reward, done, info["won"], obs
                     )
 
-                history.append((obs, matched_action))
+                history.append((steps, obs, matched_action))
                 if len(history) > history_len:
                     history.pop(0)
 
