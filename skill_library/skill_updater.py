@@ -116,8 +116,8 @@ class SkillUpdater:
         for i, traj in enumerate(trajectories, 1):
             steps = traj.get("steps", [])
             step_lines = "\n".join(
-                f"  Obs: {s['obs'][:200]}\n  Action: {s['action']}"
-                for s in steps[:10]   # cap at 10 steps to stay within context
+                f"  Obs: {s['obs']}\n  Action: {s['action']}"
+                for s in steps
             )
             parts.append(f"--- Trajectory {i} (task: {traj.get('task', '')}) ---\n{step_lines}")
         return "\n\n".join(parts)

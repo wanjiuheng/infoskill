@@ -399,7 +399,7 @@ class GroupRolloutCollector:
         # History: "(step N) obs → action" pairs
         hist_lines = []
         for j, (h_obs, h_act) in enumerate(history, 1):
-            hist_lines.append(f"Step {j}: Obs: {h_obs[:150]} → Action: {h_act}")
+            hist_lines.append(f"Step {j}: Obs: {h_obs} → Action: {h_act}")
         history_str = "\n".join(hist_lines) if hist_lines else "(none yet)"
 
         admissible_str = ", ".join(info["admissible_commands"])

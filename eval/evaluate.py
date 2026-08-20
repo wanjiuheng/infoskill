@@ -106,7 +106,7 @@ def run_eval(
                 # Build prompt
                 from training.rollout import _STEP_PROMPT
                 hist_lines = [
-                    f"Step {j+1}: Obs: {h_obs[:150]} → Action: {h_act}"
+                    f"Step {j+1}: Obs: {h_obs} → Action: {h_act}"
                     for j, (h_obs, h_act) in enumerate(history)
                 ]
                 history_str = "\n".join(hist_lines) if hist_lines else "(none yet)"
