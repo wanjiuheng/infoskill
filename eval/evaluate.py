@@ -50,6 +50,7 @@ def run_eval(
 
     max_steps      = rcfg.get("max_steps", 50)
     max_new_tokens = rcfg.get("max_new_tokens", 128)  # 从配置读取，默认 128
+    max_prompt_len = rcfg.get("max_prompt_len", 8192)
     history_len    = rcfg.get("history_len", 3)
 
     # Put modules in eval mode
@@ -119,14 +120,14 @@ def run_eval(
                     history_len=len(history),
                     history=history_str,
                     obs=obs,
-                    admissible=", ".join(info["admissible_commands"][:20]),
+                    admissible=", ".join(info["admissible_commands"]),
                 )
                 msg = [{"role": "user", "content": prompt}]
                 text = tokenizer.apply_chat_template(
                     msg, tokenize=False, add_generation_prompt=True
                 )
                 enc = tokenizer(
-                    text, return_tensors="pt", truncation=True, max_length=2048
+                    text, return_tensors="pt", truncation=True, max_length=max_prompt_len
                 ).to(device)
 
                 embed_layer  = model.get_input_embeddings()

@@ -109,7 +109,8 @@ class GroupRolloutCollector:
         skill_lib:   SkillLibrary (for retrieval + grounding text).
         device:      Compute device.
         cfg:         Rollout config dict with keys:
-                       max_steps, max_new_tokens, temperature, top_p, history_len.
+                       max_steps, max_new_tokens, max_prompt_len, temperature,
+                       top_p, history_len.
     """
 
     def __init__(
@@ -138,6 +139,7 @@ class GroupRolloutCollector:
 
         self.max_steps       = cfg.get("max_steps", 50)
         self.max_new_tokens  = cfg.get("max_new_tokens", 128)
+        self.max_prompt_len  = cfg.get("max_prompt_len", 8192)
         self.temperature     = cfg.get("temperature", 0.9)
         self.top_p           = cfg.get("top_p", 0.9)
         self.history_len     = cfg.get("history_len", 3)
@@ -400,7 +402,7 @@ class GroupRolloutCollector:
             hist_lines.append(f"Step {j}: Obs: {h_obs[:150]} → Action: {h_act}")
         history_str = "\n".join(hist_lines) if hist_lines else "(none yet)"
 
-        admissible_str = ", ".join(info["admissible_commands"][:20])  # cap for context
+        admissible_str = ", ".join(info["admissible_commands"])
 
         # Skill guidance block
         gen_skills, task_skills = self.skill_lib.retrieve(
@@ -458,7 +460,7 @@ class GroupRolloutCollector:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=2048,
+            max_length=self.max_prompt_len,
         ).to(self.device)
 
         # Get token embeddings for the prompt portion
