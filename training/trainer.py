@@ -793,6 +793,15 @@ class InfoskillTrainer:
             "optimizer":         self.optimizer.state_dict(),
             "episode_count":     self._episode_count,
             "global_step":       self._global_step,
+            # 运行时状态：不保存则 resume 后 MIG 评估短期失真（usage_history）、
+            # 已收集成功轨迹丢失（pending_traj）、曲线/CSV 从 resume 后重画
+            # （metrics/eval/steps history）。dict(...) 把 defaultdict 转普通 dict，
+            # load 时再重建 defaultdict(deque(maxlen=100))。
+            "usage_history":     dict(self._usage_history),
+            "pending_traj":      self._pending_traj,
+            "metrics_history":   self._metrics_history,
+            "eval_history":      self._eval_history,
+            "steps_history":     self._steps_history,
         }, os.path.join(path, "aux_modules.pt"))
 
         # Save current skill library
@@ -801,16 +810,12 @@ class InfoskillTrainer:
 
     def load_checkpoint(self, path: str) -> None:
         """Load from a previously saved checkpoint directory."""
-        from peft import PeftModel
-        # 从解包模型加载 LoRA，DDP 下再重新包装
-        new_model = PeftModel.from_pretrained(
-            self._base_model, os.path.join(path, "lora")
-        )
-        if self.is_ddp:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            new_model = DDP(new_model, device_ids=[self.device.index], output_device=self.device.index)
-        self.model = new_model
-        self._base_model = new_model.module if self.is_ddp else new_model
+        # 恢复 LoRA：把 adapter 权重加载到现有模型对象（set_peft_model_state_dict
+        # 保持参数对象不变，optimizer 持有的参数引用才继续有效）。不要用
+        # PeftModel.from_pretrained 重建模型——那会创建新参数对象，resume 后
+        # optimizer 更新的旧对象不再被 forward 使用，LoRA 权重将不再更新。
+        self._load_lora(path)
+
         state = torch.load(os.path.join(path, "aux_modules.pt"), map_location=self.device)
         self.encoder.load_state_dict(state["encoder"])
         self.prior_net.load_state_dict(state["prior_net"])
@@ -834,7 +839,43 @@ class InfoskillTrainer:
         else:
             logger.warning("No skills.json in %s — keeping current library", path)
 
+        # 恢复运行时状态（旧 checkpoint 无这些字段时用空默认值，保持兼容）：
+        # usage_history 丢了 → MIG 评估短期失真（无数据技能全视为 +inf 保留）；
+        # pending_traj 丢了 → 已收集的成功轨迹消失，技能生成中断；
+        # 绘图历史丢了 → 曲线/CSV 只从 resume 后开始画。
+        self._usage_history = defaultdict(
+            lambda: deque(maxlen=100),
+            {k: deque(v, maxlen=100) for k, v in state.get("usage_history", {}).items()},
+        )
+        self._pending_traj    = list(state.get("pending_traj", []))
+        self._metrics_history = list(state.get("metrics_history", []))
+        self._eval_history    = list(state.get("eval_history", []))
+        self._steps_history   = list(state.get("steps_history", []))
+
         logger.info("Loaded checkpoint from %s (episode %d)", path, self._episode_count)
+
+    def _load_lora(self, path: str) -> None:
+        """把 checkpoint 的 LoRA adapter 权重加载进现有模型，不重建模型对象。
+
+        保持 self._base_model 及其参数对象不变，这样 train.py 里基于该模型构建的
+        optimizer 参数引用在 resume 后仍然有效（否则梯度更新落在无人使用的旧
+        参数对象上，LoRA 权重静默冻结）。
+        """
+        from peft import set_peft_model_state_dict
+        lora_dir = os.path.join(path, "lora")
+        safetensors_path = os.path.join(lora_dir, "adapter_model.safetensors")
+        bin_path = os.path.join(lora_dir, "adapter_model.bin")
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+            adapter_state = load_file(safetensors_path)
+        elif os.path.exists(bin_path):
+            adapter_state = torch.load(bin_path, map_location=self.device)
+            if "state_dict" in adapter_state:  # 兼容老格式（带 state_dict 包装）
+                adapter_state = adapter_state["state_dict"]
+        else:
+            raise FileNotFoundError(f"No adapter weights found in {lora_dir}")
+        set_peft_model_state_dict(self._base_model, adapter_state)
+        logger.info("LoRA adapter loaded from %s", lora_dir)
 
     def _save_metrics_plot(self) -> None:
         """
