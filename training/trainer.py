@@ -844,7 +844,11 @@ class InfoskillTrainer:
         # optimizer 更新的旧对象不再被 forward 使用，LoRA 权重将不再更新。
         self._load_lora(path)
 
-        state = torch.load(os.path.join(path, "aux_modules.pt"), map_location=self.device)
+        # weights_only=False: this file is our own checkpoint (trusted) and
+        # contains non-tensor state (usage_history is a defaultdict(deque)),
+        # which torch 2.6's default weights_only=True rejects.
+        state = torch.load(os.path.join(path, "aux_modules.pt"), map_location=self.device,
+                            weights_only=False)
         self.encoder.load_state_dict(state["encoder"])
         self.prior_net.load_state_dict(state["prior_net"])
         self.projector.load_state_dict(state["projector"])
