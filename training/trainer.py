@@ -171,23 +171,30 @@ class InfoskillTrainer:
 
     def _setup_action_loggers(self) -> None:
         """Setup separate loggers for rollout actions and eval episodes."""
+        # DDP: every rank writes rollout actions concurrently, and interleaved
+        # lines from different ranks make it impossible to tell which GPU did
+        # what during a deadlock hang. Suffix filenames with _rank{N} so each
+        # rank gets its own file. (eval only ever runs on rank 0, but the
+        # suffix is applied uniformly for consistency.)
+        suffix = f"_rank{self.rank}" if self.is_ddp else ""
+
         # Rollout action logger
-        self.action_logger = logging.getLogger("rollout_actions")
+        self.action_logger = logging.getLogger(f"rollout_actions{suffix}")
         self.action_logger.setLevel(logging.INFO)
         self.action_logger.propagate = False  # Don't propagate to root logger
         action_handler = logging.FileHandler(
-            os.path.join(self._run_log_dir, "rollout_actions.log"),
+            os.path.join(self._run_log_dir, f"rollout_actions{suffix}.log"),
             encoding="utf-8"
         )
         action_handler.setFormatter(logging.Formatter("%(message)s"))
         self.action_logger.addHandler(action_handler)
 
         # Eval episode logger
-        self.eval_logger = logging.getLogger("eval_episodes")
+        self.eval_logger = logging.getLogger(f"eval_episodes{suffix}")
         self.eval_logger.setLevel(logging.INFO)
         self.eval_logger.propagate = False
         eval_handler = logging.FileHandler(
-            os.path.join(self._run_log_dir, "eval_episodes.log"),
+            os.path.join(self._run_log_dir, f"eval_episodes{suffix}.log"),
             encoding="utf-8"
         )
         eval_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -423,7 +430,23 @@ class InfoskillTrainer:
         active_records: List[StepRecord] = [
             r for r in buf.records if not r.is_padding and r.is_valid
         ]
-        if not active_records:
+
+        # DDP: whether active_records is empty is rank-local (depends on that
+        # rank's own rollout sampling). If only one rank early-returns here,
+        # it skips this call's entire collective-op sequence (mini-batch
+        # loop's backward()s + the aux-module all_reduce below) while the
+        # other rank still issues them — the two ranks' collective-op counts
+        # diverge permanently and NCCL eventually deadlocks (observed: ranks
+        # stuck on mismatched ALLREDUCE numels, tens of calls apart). Fix:
+        # sync an "is empty" flag across ranks first; if ANY rank is empty,
+        # ALL ranks skip this round together, so the skip is never unilateral.
+        is_empty = not active_records
+        if self.is_ddp:
+            import torch.distributed as dist
+            flag = torch.tensor([1 if is_empty else 0], device=self.device, dtype=torch.long)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            is_empty = bool(flag.item())
+        if is_empty:
             return {
                 "total": 0.0, "policy": 0.0, "fidelity": 0.0,
                 "rate": 0.0, "grounding": 0.0

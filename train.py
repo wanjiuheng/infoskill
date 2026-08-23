@@ -36,16 +36,23 @@ from peft import LoraConfig, get_peft_model
 logger = logging.getLogger("train")
 
 
-def setup_logging(log_dir: str, run_log_dir: str) -> None:
+def setup_logging(log_dir: str, run_log_dir: str, rank: int = 0, is_ddp: bool = False) -> None:
     """
     Log to both stdout and a timestamped file under log_dir.
 
     Args:
         log_dir: Base log directory (e.g., "logs")
         run_log_dir: Run-specific directory (e.g., "logs/run_20260817_123456")
+        rank: Process rank (0 for single-GPU).
+        is_ddp: True when running under torchrun multi-GPU. When True the
+            progress file gets a _rank{N} suffix so concurrent ranks never
+            interleave lines into one shared file — interleaved logs make it
+            impossible to tell which GPU hit an error, or how far each rank got
+            before a DDP deadlock hang.
     """
     os.makedirs(run_log_dir, exist_ok=True)
-    log_path = os.path.join(run_log_dir, "train_progress.log")
+    suffix = f"_rank{rank}" if is_ddp else ""
+    log_path = os.path.join(run_log_dir, f"train_progress{suffix}.log")
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -364,7 +371,7 @@ def main():
     cfg["paths"]["checkpoint_dir"] = os.path.join(cfg["paths"]["checkpoint_dir"], run_name)
 
     run_log_dir = os.path.join(cfg["paths"]["log_dir"], run_name)
-    setup_logging(cfg["paths"]["log_dir"], run_log_dir)
+    setup_logging(cfg["paths"]["log_dir"], run_log_dir, rank=rank, is_ddp=is_ddp)
     if rank == 0:
         logger.info("Run name: %s (checkpoint_dir=%s, run_log_dir=%s)",
                      run_name, cfg["paths"]["checkpoint_dir"], run_log_dir)
