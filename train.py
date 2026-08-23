@@ -196,11 +196,18 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # In DDP mode, wrap with DistributedDataParallel
+    # In DDP mode, wrap with DistributedDataParallel.
+    # broadcast_buffers=False: skip the per-forward buffer broadcast — LoRA+Qwen2
+    # has no buffers that need cross-rank sync (RMSNorm has no running stats),
+    # and each rank's _fast_update() mini-batch loop calls this model's forward()
+    # a different number of times (active_records count N differs per rank), so
+    # the default per-forward broadcast would deadlock once rank forward counts
+    # diverge (see no_sync() usage in trainer.py's _fast_update).
     if is_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[device.index], output_device=device.index)
-        logger.info("Wrapped model with DDP")
+        model = DDP(model, device_ids=[device.index], output_device=device.index,
+                    broadcast_buffers=False)
+        logger.info("Wrapped model with DDP (broadcast_buffers=False)")
     else:
         model = model.to(device)
 

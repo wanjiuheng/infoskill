@@ -445,9 +445,24 @@ class InfoskillTrainer:
 
         # 4. Mini-batch recomputation loop
         #    self.mini_batch_size（training.mini_batch_size）是每次 forward +
-        #    backward 的 step 数量，可根据显存调整；越小越省显存，但 backward
-        #    调用次数越多（通信开销略增）。
+        #    backward 的 step 数量，可根据显存调整；越小越省显存。
+        #
+        #    DDP note: N (active_records count) is rank-local — it depends on
+        #    each rank's own rollout sampling (is_valid filtering), so the two
+        #    ranks' number of mini-batches, ceil(N/batch_size), can differ.
+        #    self.model is DDP-wrapped, and DDP's default behavior triggers a
+        #    gradient all-reduce on every backward() — if one rank calls
+        #    backward() more times than the other in this loop, their
+        #    collective-op sequences diverge and NCCL deadlocks (each rank
+        #    waits for a collective the other rank never issues). Fix: wrap
+        #    every backward() except the last mini-batch in self.model.no_sync()
+        #    (accumulates gradients locally, skips the all-reduce); only the
+        #    final backward() syncs, and it captures the full accumulated
+        #    gradient (still the same .grad tensors). This makes each rank
+        #    contribute exactly one all-reduce per _fast_update call, always,
+        #    regardless of N or how many mini-batches it took.
         batch_size = self.mini_batch_size
+        n_mini_batches = -(-N // batch_size)  # ceil(N / batch_size), rank-local
         self.optimizer.zero_grad()  # 清空梯度，准备累加
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）
@@ -458,10 +473,11 @@ class InfoskillTrainer:
         g_loss_accum = 0.0
         num_batches = 0
 
-        for i in range(0, N, batch_size):
+        for bi, i in enumerate(range(0, N, batch_size)):
             batch_records = active_records[i : i + batch_size]
             batch_adv = advantages[i : i + batch_size]  # [B]
             B = len(batch_records)
+            is_last_mini_batch = (bi == n_mini_batches - 1)
 
             # ── 4a. 重新计算 encoder forward（带梯度）──────────────────────────
             state_embs_b = torch.stack(
@@ -526,7 +542,15 @@ class InfoskillTrainer:
 
             # ── 4h. Backward（梯度累加）────────────────────────────────────────
             # 注意：不调用 optimizer.zero_grad()，这样梯度会累加到之前的 mini-batch
-            total_b.backward()
+            # DDP: only the last mini-batch's backward() triggers the gradient
+            # all-reduce (see comment above the loop); earlier ones accumulate
+            # locally via no_sync() so every rank does exactly one all-reduce
+            # per call regardless of how many mini-batches it ran.
+            if self.is_ddp and not is_last_mini_batch:
+                with self.model.no_sync():
+                    total_b.backward()
+            else:
+                total_b.backward()
 
             # 累积 loss 用于日志（按 batch size 加权平均）
             total_loss_accum += total_b.item() * B
@@ -536,22 +560,38 @@ class InfoskillTrainer:
             g_loss_accum += (g_b.item() if isinstance(g_b, torch.Tensor) else g_b) * B
             num_batches += B
 
-        # 5. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）
+        # 5. In DDP mode, sync auxiliary-module gradients across ranks.
+        # encoder/prior_net/projector/reward_predictor/grounding_decoder are
+        # plain nn.Modules, never wrapped in DDP (only self.model, the LLM, is)
+        # — so unlike the LLM their gradients were never cross-rank synced;
+        # each rank was silently training its own diverging copy. Doing this
+        # here (once, after the mini-batch loop, before optimizer.step()) is
+        # safe regardless of how many mini-batches each rank ran: every rank
+        # reaches this line exactly once per _fast_update() call.
+        if self.is_ddp:
+            import torch.distributed as dist
+            aux_modules = [
+                self.encoder, self.prior_net, self.projector,
+                self.reward_predictor, self.grounding_decoder,
+            ]
+            for m in aux_modules:
+                for p in m.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad /= self.world_size
+
+        # 6. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）
         nn.utils.clip_grad_norm_(self._all_params(), self.grad_clip)
         self.optimizer.step()
 
-        # 6. In DDP mode, synchronize gradients across all processes
-        # Note: DDP already handles gradient synchronization automatically during backward(),
-        # so no explicit sync is needed here. The gradients are already averaged across ranks.
-
-        # 6. 更新 usage history（用于 Slow Module MIG 计算）
+        # 7. 更新 usage history（用于 Slow Module MIG 计算）
         with torch.no_grad():
             for rec, adv in zip(active_records, adv_list):
                 self._usage_history[rec.skill_text[:50]].append(
                     (rec.state_emb.cpu(), float(adv))
                 )
 
-        # 7. 返回平均 loss（用于日志）
+        # 8. 返回平均 loss（用于日志）
         return {
             "total": total_loss_accum / num_batches,
             "policy": p_loss_accum / num_batches,
