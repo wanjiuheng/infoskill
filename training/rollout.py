@@ -491,15 +491,32 @@ class GroupRolloutCollector:
         )
         attention_mask = torch.cat([prefix_mask, enc.attention_mask], dim=1)
 
-        output_ids = self.model.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+        # Run generate() in eval mode: rollout is entirely under torch.no_grad()
+        # (see collect()) and never needs a gradient path, so there is no reason
+        # to run it through the train-mode + gradient-checkpointing branch of
+        # Qwen2DecoderLayer.forward(). Diagnosis showed that switching back to
+        # train mode after the first eval() call corrupts this exact
+        # train-mode + gradient-checkpointing + sampling generate() path (output
+        # degenerates into repeated tokens ignoring the prompt), while eval-mode
+        # greedy generate() from the same weights stays correct throughout. Using
+        # eval mode here reuses that known-good inference path. Save/restore the
+        # previous mode so we don't clobber it if the model was already in eval
+        # mode for some other reason (e.g. scripts/eval_checkpoint.py).
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            output_ids = self.model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+        finally:
+            if was_training:
+                self.model.train()
 
         # generate() only returns newly generated tokens when called with inputs_embeds
         gen_ids_full = output_ids  # [n_active, gen_len]
