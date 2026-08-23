@@ -1,0 +1,84 @@
+# InfoSkill ALFWorld Configuration — DEBUG: eval→rollout 乱码复现
+#
+# 目的：验证"第一次 eval 结束后紧跟的 rollout 会输出退化乱码（每步打满
+# max_new_tokens）"这一假设，不需要等 200 episode。
+#
+# 做法：
+#   - eval_freq 设成 group_size 的 2 倍 → group2 结束后立刻触发 eval
+#   - eval_episodes 只用 4 个 → 够跑通 model.eval()/generate/model.train()
+#     的切换即可，不需要统计意义上的成功率
+#   - rollout.max_steps 降到 3 → 每组几秒钟跑完
+#   - group_size / temperature / top_p / gradient checkpointing 全局开关
+#     与生产配置保持一致 —— 怀疑的机制正是"train 模式 + gradient
+#     checkpointing + sampling generate"和 eval 模式切换的交互，这些必须
+#     原样复现，不能一起简化掉
+#
+# 用法（训练机上，和正式训练同一套环境）：
+#   python train.py --config configs/alfworld_debug_eval_repro.yaml --run-name eval_repro_debug
+#   python scripts/check_eval_corruption.py logs_debug_eval_repro/eval_repro_debug/train_progress.log --max-new-tokens 128
+#
+# 预期：5 组（group1-5，episode 1-20），group1-2 是 eval 前基线，group2
+# 结束后触发 eval，group3 是 eval 后第一组——这是要盯的组。整个跑完预期在
+# 1-2 分钟量级（4 卡/单卡皆可，单卡即可复现，不需要多卡）。
+
+paths:
+  alfworld_config: "envs/alfworld_base_config.yaml"
+  skills_json: "skill_library/data/claude_style_skills.json"
+  checkpoint_dir: "checkpoints_debug_eval_repro"
+  log_dir: "logs_debug_eval_repro"
+
+model:
+  # 用户已确认无 SFT 的原版模型也会复现"eval 后突变成一堆 0"，所以默认用
+  # 原版路径，不依赖 SFT 产物。如果想更贴近事故 run，改成 SFT checkpoint：
+  # /models/wanjh2/models/Qwen/sft/Alfworld-7B-SFT/checkpoint-140
+  backbone: "/models/wanjh2/models/Qwen/Qwen2.5-7B-Instruct"
+  hidden_size: 3584
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+
+fast:
+  latent_dim: 64
+  num_prefix: 8
+  grounding_hidden_dim: 512
+  grounding_max_len: 64
+
+loss:
+  alpha1: 0.1
+  alpha2: 0.01
+  beta: 0.001
+
+rollout:
+  group_size: 4            # 与事故 run 一致 —— 怀疑 batch=4 是必要条件之一，不简化
+  max_steps: 3              # 30 → 3，只为缩短每组耗时，不影响崩坏机制本身
+  max_new_tokens: 128        # 512 → 128，加速 decode；崩坏的信号是"每步都打满
+                              # max_new_tokens"，128 一样能看出这个信号
+  temperature: 0.9
+  top_p: 0.9
+  history_len: 3
+
+training:
+  num_episodes: 20          # 5 组：group1-2(基线) → eval → group3-5(观察)
+  learning_rate: 1.0e-6      # 与事故 run 一致
+  grad_clip: 1.0
+  batch_accumulation: 1
+  mini_batch_size: 4
+
+  slow_update_interval: 100000  # 关掉 Slow Module，避免它干扰判断
+  mig_beta: 0.001
+
+  save_freq: 100000          # 关掉 checkpoint 保存，不需要
+  eval_freq: 8               # group_size(4) × 2 → episode_count=8（group2 结束）后触发
+  eval_episodes: 4           # 只需要跑通 eval 模式切换，不需要成功率统计意义
+
+skill_library:
+  top_k_task: 6
+  max_skills: 200
+  skill_gen_batch: 5
+  success_reward_threshold: 7.0
+
+device: "cuda"
+seed: 42
