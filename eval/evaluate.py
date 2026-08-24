@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -57,6 +58,15 @@ def run_eval(
     max_prompt_len = rcfg.get("max_prompt_len", 8192)
     history_len    = rcfg.get("history_len", 3)
 
+    # DDP 分片：所有 rank 共同评估，各自只跑一段连续切片，最后 all_gather 合并。
+    # 若不拆，只有 rank0 评估全部 n_episodes（140 局约 3h），其他 rank 在训练循环
+    # 的 barrier 上空等 → NCCL barrier 600s 超时被杀（run 20260824）。独立单卡
+    # eval 脚本（scripts/eval_checkpoint.py）的 trainer 代理没有这些字段，
+    # 用 getattr 给单机默认值，行为与原先一致。
+    is_ddp     = bool(getattr(trainer, "is_ddp", False))
+    rank       = int(getattr(trainer, "rank", 0))
+    world_size = int(getattr(trainer, "world_size", 1))
+
     # Put modules in eval mode
     model.eval()
     encoder.eval()
@@ -88,10 +98,39 @@ def run_eval(
         )
         n_episodes = pool_size
     if reuse_env:
+        # 先把全局 np RNG 固定到 EVAL_ORDER_SEED，再让底层 seed() 洗牌。底层
+        # TextworldBatchGymEnv.seed() 用 np.random.shuffle(game_files) 洗牌；它
+        # 内部是否先 np.random.seed(seed) 不确定，而训练按 seed+rank 播种后各
+        # rank 全局 RNG 状态不同——若它直接消费全局状态，DDP 两 rank 会洗出不同
+        # 顺序，分片切片就错乱（重复/遗漏）。先固定全局 RNG 则无论其内部行为都
+        # 得到同一顺序，同时让单卡 eval 顺序也变成 EVAL_ORDER_SEED 的纯函数
+        # （不再受训练进度影响）。
+        np.random.seed(EVAL_ORDER_SEED)
         env.reseed(EVAL_ORDER_SEED)   # 固定打乱一次顺序，保证可复现
 
+    # ── DDP 分片：本 rank 评估的绝对 episode 区间 [slice_start, slice_end) ───
+    # 两 rank 基于同一个 EVAL_ORDER_SEED 洗牌（env.reseed 内部按 seed 洗 game_files，
+    # seed 确定则洗牌结果确定），各自切片互不重叠、合并后恰好覆盖全部 n_episodes，
+    # 无放回语义保持。rank r 用连续 reset() 跳过它之前的 r*n_per_rank 个 game，
+    # 从自己切片起点开始评估。
+    if is_ddp and world_size > 1:
+        n_per_rank  = -(-n_episodes // world_size)          # ceil
+        slice_start = rank * n_per_rank
+        slice_end   = min(slice_start + n_per_rank, n_episodes)
+        if not reuse_env:
+            logger.warning(
+                "rank=%d DDP eval 分片依赖 reuse_env（env.reseed），当前 env 不支持，"
+                "切片定位可能不准确", rank,
+            )
+    else:
+        slice_start, slice_end = 0, n_episodes
+    if slice_start > 0:
+        for _ in range(slice_start):
+            env.reset()   # 丢弃，仅推进底层 game 指针到本 rank 切片起点
+        logger.info("rank=%d eval slice: episodes [%d, %d)", rank, slice_start, slice_end)
+
     with torch.no_grad():
-        pbar = tqdm(range(n_episodes), desc="Eval", unit="ep", dynamic_ncols=True)
+        pbar = tqdm(range(slice_start, slice_end), desc="Eval", unit="ep", dynamic_ncols=True)
         for ep_idx in pbar:
             ep_start = time.time()
             if ep_idx > 0 and not reuse_env:
@@ -253,7 +292,8 @@ def run_eval(
             total_so_far = sum(len(v) for v in results.values())
             running_sr = so_far / total_so_far if total_so_far else 0.0
             elapsed_total = time.time() - eval_start
-            eta = elapsed_total / total_so_far * (n_episodes - total_so_far) if total_so_far else 0.0
+            # ETA 按本 rank 切片剩余局数算（不是全局 n_episodes）
+            eta = elapsed_total / total_so_far * (slice_end - ep_idx - 1) if total_so_far else 0.0
 
             pbar.set_postfix(task=task_type[:12], won=won, steps=steps, sr=f"{running_sr:.2f}", s_ep=f"{ep_time:.1f}s")
             logger.info(
@@ -267,7 +307,6 @@ def run_eval(
 
     # Compute metrics
     metrics: Dict[str, float] = {}
-    all_results: List[bool] = []
 
     # 按照 6 个任务类型的顺序输出
     TASK_ORDER = [
@@ -279,32 +318,50 @@ def run_eval(
         "examine",
     ]
 
-    logger.info("\n" + "="*70)
-    logger.info("Eval Results: %d episodes", n_episodes)
-    logger.info("="*70)
+    # 每个任务类型聚合 (wins, total)。DDP 分片下各 rank 只评估一部分 game，
+    # 需要 all_gather 合并成全局计数；单卡（独立 eval 脚本）直接用本 rank 结果。
+    if is_ddp and world_size > 1:
+        import torch.distributed as dist
+        local_counts = torch.zeros(len(TASK_ORDER), 2, dtype=torch.long, device=device)
+        for ti, tt in enumerate(TASK_ORDER):
+            wins = results.get(tt, [])
+            local_counts[ti, 0] = sum(wins)
+            local_counts[ti, 1] = len(wins)
+        gathered = [torch.zeros_like(local_counts) for _ in range(world_size)]
+        dist.all_gather(gathered, local_counts)
+        final_counts = torch.stack(gathered).sum(dim=0).cpu()
+    else:
+        final_counts = torch.zeros(len(TASK_ORDER), 2, dtype=torch.long)
+        for ti, tt in enumerate(TASK_ORDER):
+            wins = results.get(tt, [])
+            final_counts[ti, 0] = sum(wins)
+            final_counts[ti, 1] = len(wins)
 
-    for task_type in TASK_ORDER:
-        if task_type in results:
-            wins = results[task_type]
-            rate = sum(wins) / len(wins) if wins else 0.0
-            metrics[f"success/{task_type}"] = rate
-            all_results.extend(wins)
-            logger.info(
-                "  %-25s  %3d/%3d  %.4f  (%.1f%%)",
-                task_type, sum(wins), len(wins), rate, rate * 100
-            )
-        else:
-            logger.info("  %-25s  %3d/%3d  %.4f  (%.1f%%)", task_type, 0, 0, 0.0, 0.0)
+    total_episodes = int(final_counts[:, 1].sum().item())
+    for ti, tt in enumerate(TASK_ORDER):
+        wins  = int(final_counts[ti, 0].item())
+        total = int(final_counts[ti, 1].item())
+        metrics[f"success/{tt}"] = wins / total if total else 0.0
+    total_wins = int(final_counts[:, 0].sum().item())
+    metrics["success/overall"] = total_wins / total_episodes if total_episodes else 0.0
 
-    overall_rate = sum(all_results) / len(all_results) if all_results else 0.0
-    metrics["success/overall"] = overall_rate
-
-    logger.info("-" * 70)
-    logger.info(
-        "  %-25s  %3d/%3d  %.4f  (%.1f%%)",
-        "OVERALL", sum(all_results), len(all_results), overall_rate, overall_rate * 100
-    )
-    logger.info("="*70 + "\n")
+    # 汇总打印（DDP 只在 rank0 打印，避免重复刷屏）
+    if not (is_ddp and world_size > 1) or rank == 0:
+        logger.info("\n" + "="*70)
+        logger.info("Eval Results: %d episodes", total_episodes)
+        logger.info("="*70)
+        for ti, tt in enumerate(TASK_ORDER):
+            wins  = int(final_counts[ti, 0].item())
+            total = int(final_counts[ti, 1].item())
+            rate  = metrics[f"success/{tt}"]
+            logger.info("  %-25s  %3d/%3d  %.4f  (%.1f%%)", tt, wins, total, rate, rate * 100)
+        logger.info("-" * 70)
+        logger.info(
+            "  %-25s  %3d/%3d  %.4f  (%.1f%%)",
+            "OVERALL", total_wins, total_episodes, metrics["success/overall"],
+            metrics["success/overall"] * 100
+        )
+        logger.info("="*70 + "\n")
 
     # Restore training mode
     model.train()

@@ -372,14 +372,19 @@ class InfoskillTrainer:
             # ── Eval ──────────────────────────────────────────────────────────
             if eval_env_factory is not None and self._episode_count >= self._next_eval_ep and self._episode_count > 0:
                 self._next_eval_ep += self.eval_freq
-                if self.rank == 0:
-                    from eval.evaluate import run_eval
-                    metrics = run_eval(
-                        self, eval_env_factory,
-                        n_episodes=self.cfg["training"]["eval_episodes"],
-                        eval_logger=self.eval_logger  # Pass eval logger
-                    )
+                # DDP: 所有 rank 共同评估（run_eval 内部按 rank 切分游戏池，结果
+                # all_gather 合并），rank0 记录指标。此前只有 rank0 评估全部 140
+                # 局（eval_episodes=140 时约 3h），其他 rank 在下方 barrier 空等 →
+                # NCCL barrier 600s 超时被杀（run 20260824 03:58，ALLREDUCE numel=1
+                # SeqNum 6995）。分片后各 rank 耗时相当，barrier 快速配对。
+                from eval.evaluate import run_eval
+                metrics = run_eval(
+                    self, eval_env_factory,
+                    n_episodes=self.cfg["training"]["eval_episodes"],
+                    eval_logger=self.eval_logger  # Pass eval logger (per-rank)
+                )
 
+                if self.rank == 0:
                     # Record eval result and plot
                     overall_sr = metrics.get("success/overall", 0.0)
                     self._eval_history.append({
@@ -388,7 +393,8 @@ class InfoskillTrainer:
                     })
                     self._save_eval_plot()
                     self._save_eval_csv()  # 保存 eval CSV 数据
-                # Barrier: ensure all ranks wait for rank 0 to finish evaluation
+                # Barrier: ensure all ranks wait before proceeding (both ranks
+                # finished their eval slices ~simultaneously → fast pairing)
                 if self.is_ddp:
                     import torch.distributed as dist
                     dist.barrier()
