@@ -203,6 +203,27 @@ class GroupRolloutCollector:
             for info in info_list
         ]
 
+        # 诊断（tasks_per_batch>1 时确认多任务正确性）：按任务组打印每组
+        # task_description 的唯一性。组内（同 seed）必须 1 个唯一值；组间
+        # （不同 seed）必须不同——若组间相同，说明底层 seed 洗牌没生效，
+        # 两个任务实际是同一个（tpb=2 的正确性前提被破坏）。
+        # 注意：Step 日志里 8 个 env token 数相同是 all 语义 batch 同步的
+        # 必然结果，不是任务相同的证据，只有这里打印的 task_description 能
+        # 真正区分任务。
+        for gi in range(0, len(info_list), self.group_size):
+            group = info_list[gi:gi + self.group_size]
+            descs = {g["task_description"] for g in group}
+            logger.info(
+                "Task group %d (episodes %d-%d): %d unique task_desc%s",
+                gi // self.group_size, gi, gi + self.group_size - 1, len(descs),
+                " (SAME!)" if len(descs) == 1 else " (DIFFERENT!)",
+            )
+            for j, g in enumerate(group):
+                logger.info(
+                    "  task group %d ep %d: %s", gi // self.group_size, gi + j,
+                    g["task_description"],
+                )
+
         # ── Step loop ─────────────────────────────────────────────────────────
         # Everything in this loop runs under no_grad: rollout never needs a
         # computation graph. That graph is rebuilt, one mini-batch at a time,
