@@ -1,14 +1,16 @@
-# InfoSkill ALFWorld 配置 —— DEBUG 专用（验证 eval 双卡分片）
-# 用法：训练机 git pull 后跑 torchrun，看到第一次 eval 的分片/合并结果即可，
-# 目的不是训练，跑完删除本文件或直接 --config 指回 alfworld.yaml。
+# InfoSkill ALFWorld 配置 —— DEBUG 专用（验证 tasks_per_batch=2 多任务并行）
+# 用法：训练机 git pull 后跑 torchrun，看到 rollout 阶段 N≈240、两个不同
+# task_description，且 eval 分片正常即通过。目的不是训练。
 #
-# 与 alfworld.yaml 的差异（仅 training 段）：
-#   num_episodes: 16    → 训练很快到顶，正好只触发 1 次 eval（ep8 触发后
-#                         _next_eval_ep=16，ep16 到顶结束，不会连环 eval）
-#   eval_freq:    8     → ep8 之后立刻进入 eval，快速验证分片不死锁/不报错
-#   eval_episodes: 20   → DEBUG：两 rank 各 10 局（约 15min），验证同一套
-#                         分片/合并代码路径足够。如想顺便验证真实的 70/70
-#                         分配，改回 140（两 rank 各 70 局，约 1.6h）。
+# 与 alfworld.yaml 的差异（仅 rollout/training 段）：
+#   num_episodes: 16    → 每轮 episode 增量 = G*tasks_per_batch*world_size =
+#                         4*2*2=16，所以第 1 轮跑满 16 ep 即到顶结束（只 1 轮
+#                         rollout，正好验证 tpb=2 行为；eval 在第 1 轮后触发一次）
+#   eval_freq:    8     → ep16 触发一次 eval（增量 16 跳过了 ep8），验证
+#                         eval 在 tpb=2 后仍正常分片/不死锁
+#   eval_episodes: 20   → DEBUG：两 rank 各 10 局（约 15min）
+#   tasks_per_batch: 2  → 与正式配置一致，验证多任务并行 rollout
+#   mini_batch_size: 16 → 与正式配置一致，验证 update 阶段显存/耗时
 # 其余字段与 alfworld.yaml 完全一致。
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -45,7 +47,7 @@ loss:
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
   group_size: 4               # G: parallel episodes per task
-  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
+  tasks_per_batch: 2          # 与正式配置一致：一批跑 2 个任务 × 各 4 局
   max_steps: 30               # max steps per episode
   max_new_tokens: 512         # LLM generation budget per step
   max_prompt_len: 8192        # per-step prompt hard cap (tokenizer max_length)
@@ -55,11 +57,11 @@ rollout:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
-  num_episodes: 16            # DEBUG：调小到 16，ep8 触发一次 eval 后 ep16 到顶结束
+  num_episodes: 16            # DEBUG：每轮增量 16，1 轮到顶（见顶部注释）
   learning_rate: 1.0e-6
   grad_clip: 1.0
   batch_accumulation: 1
-  mini_batch_size: 10
+  mini_batch_size: 16          # 与正式配置一致
 
   # Slow module
   slow_update_interval: 200   # 16 局内不触发，保持默认

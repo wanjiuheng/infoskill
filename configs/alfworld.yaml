@@ -34,7 +34,11 @@ loss:
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
   group_size: 4               # G: parallel episodes per task
-  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
+  tasks_per_batch: 2          # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）。
+                                # 2 = 同批跑2个任务×各4局，共享一次 generate() 提升
+                                # rollout 吞吐；GRPO advantage 仍按组(group_size)独立算。
+                                # 代价：N 翻倍 → update 阶段耗时约翻倍（净成本，实测
+                                # update 峰值显存只取决于 mini_batch_size，不受此影响）。
   max_steps: 30                # max steps per episode
   max_new_tokens: 512         # LLM generation budget per step
   max_prompt_len: 8192        # per-step prompt hard cap (tokenizer max_length);
@@ -55,8 +59,12 @@ training:
                                 # string, not a float — always write "1.0e-4" style.
   grad_clip: 1.0
   batch_accumulation: 1
-  mini_batch_size: 10          # bs：_fast_update() 每次 forward+backward 重算
-                                # log_prob 的 mini-batch 大小（不是 rollout.group_size）
+  mini_batch_size: 16          # bs：_fast_update() 每次 forward+backward 重算
+                                # log_prob 的 mini-batch 大小（不是 rollout.group_size）。
+                                # 训练机原用 32 实测 update 峰值 ~80GB（只剩 ~2GB 余量，
+                                # OOM 边缘）。降到 16 峰值 ~65GB 留 ~15GB 余量，且 update
+                                # 总耗时与 mbs 无关（总 FLOPs 恒定），零时间代价。tasks_per_batch
+                                # 只影响 N/耗时，不影响这里的选择。
 
   # Slow module
   slow_update_interval: 200   # T: steps between library maintenance runs
