@@ -19,6 +19,7 @@ from tqdm import tqdm
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
 from utils.embedding import get_text_embedding
+from utils.stopping_criteria import build_action_stop_criteria
 from models.encoder import sample_z
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,9 @@ def run_eval(
                     max_new_tokens=max_new_tokens,
                     do_sample=False,            # greedy decoding for eval
                     pad_token_id=tokenizer.eos_token_id,
+                    # 出现 </action>（动作已给出）立即停止，省掉后续多余的
+                    # token（eval 提速，单序列无连带截断问题）。
+                    stopping_criteria=build_action_stop_criteria(tokenizer),
                 )
 
                 # generate() only returns newly generated tokens when called with inputs_embeds

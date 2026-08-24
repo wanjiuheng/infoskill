@@ -19,3 +19,23 @@ matplotlib                      # loss/eval/steps 曲线绘图
 # ALFWorld environment (text mode: AlfredTWEnv)
 alfworld
 textworld[pddl]>=1.6.1
+
+# FlashAttention-2 加速（train.py / eval_checkpoint.py 里
+# attn_implementation="flash_attention_2" 需要 flash-attn 包）。
+# flash-attn 无稳定通用 wheel，安装很挑 CUDA/PyTorch 版本，故意不放进
+# 强制依赖列表，避免 pip install -r 因此失败；需单独安装。
+#
+# 换机器安装步骤（2026-08 训练机实测通过，A800 80GB）：
+#   1. 前置：先装好 torch 并确认 CUDA 可用
+#        python -c "import torch; print(torch.__version__, torch.version.cuda)"
+#      实测组合：python 3.11.15 / torch 2.6.0+cu124 / cuda 12.4
+#      （torch==2.6.0 默认就是 cu124 build，无需额外索引）
+#   2. 安装（直接走 pypi，有匹配的预编译 wheel，无需编译）：
+#        pip install flash-attn==2.7.4.post1
+#      ⚠️ 不要从 github 装：训练机 DNS 解析不了 github.com，
+#         `pip install https://github.com/...` 报
+#         Failed to resolve IP address for 'github.com'
+#   3. 验证（打印版本、CUDA 可用性、跑一次真实 FA2 forward）：
+#        python scripts/check_flash_attn.py
+#      看到 "ALL PASS: flash-attn 可用" 即通过；FAIL 说明
+#      torch/CUDA/flash-attn 版本组合不匹配，需换匹配版本。

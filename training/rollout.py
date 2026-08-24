@@ -23,6 +23,7 @@ from typing import List, Dict, Optional, Tuple, Any
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
 from utils.embedding import get_text_embedding
+from utils.stopping_criteria import build_action_stop_criteria
 
 logger = logging.getLogger("rollout")
 
@@ -513,6 +514,10 @@ class GroupRolloutCollector:
                 top_p=self.top_p,
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
+                # 出现 </action>（动作已给出）立即停止，省掉后续多余的
+                # think/收尾 token（rollout 提速）。整批共享：任一序列
+                # 触发即整批停；同 GRPO 组内输出长度高度相似，风险很小。
+                stopping_criteria=build_action_stop_criteria(self.tokenizer),
             )
         finally:
             if was_training:
