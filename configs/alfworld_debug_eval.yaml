@@ -1,0 +1,81 @@
+# InfoSkill ALFWorld 配置 —— DEBUG 专用（验证 eval 双卡分片）
+# 用法：训练机 git pull 后跑 torchrun，看到第一次 eval 的分片/合并结果即可，
+# 目的不是训练，跑完删除本文件或直接 --config 指回 alfworld.yaml。
+#
+# 与 alfworld.yaml 的差异（仅 training 段）：
+#   num_episodes: 16    → 训练很快到顶，正好只触发 1 次 eval（ep8 触发后
+#                         _next_eval_ep=16，ep16 到顶结束，不会连环 eval）
+#   eval_freq:    8     → ep8 之后立刻进入 eval，快速验证分片不死锁/不报错
+#   eval_episodes: 20   → DEBUG：两 rank 各 10 局（约 15min），验证同一套
+#                         分片/合并代码路径足够。如想顺便验证真实的 70/70
+#                         分配，改回 140（两 rank 各 70 局，约 1.6h）。
+# 其余字段与 alfworld.yaml 完全一致。
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+paths:
+  alfworld_config: "envs/alfworld_base_config.yaml"   # AlfredTWEnv config
+  skills_json: "skill_library/data/claude_style_skills.json"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+model:
+  backbone: "/models/wanjh2/models/Qwen/Qwen2.5-7B-Instruct"
+  hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+
+# ── Fast Module (Encoder / Projector / Predictors) ────────────────────────────
+fast:
+  latent_dim: 64              # z_tilde dimension
+  num_prefix: 8               # m: number of soft prefix tokens
+  grounding_hidden_dim: 512   # GroundingDecoder LSTM hidden size
+  grounding_max_len: 64       # max tokens for grounding target (title + principle)
+
+# ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
+loss:
+  alpha1: 0.1                 # weight for (fidelity + beta*rate)
+  alpha2: 0.01                # weight for grounding loss
+  beta: 0.001                 # compression strength: higher = more aggressive compression
+
+# ── GRPO / Rollout ────────────────────────────────────────────────────────────
+rollout:
+  group_size: 4               # G: parallel episodes per task
+  max_steps: 30               # max steps per episode
+  max_new_tokens: 512         # LLM generation budget per step
+  max_prompt_len: 8192        # per-step prompt hard cap (tokenizer max_length)
+  temperature: 0.9
+  top_p: 0.9
+  history_len: 3              # how many past (obs, action) pairs to include in prompt
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  num_episodes: 16            # DEBUG：调小到 16，ep8 触发一次 eval 后 ep16 到顶结束
+  learning_rate: 1.0e-6
+  grad_clip: 1.0
+  batch_accumulation: 1
+  mini_batch_size: 10
+
+  # Slow module
+  slow_update_interval: 200   # 16 局内不触发，保持默认
+  mig_beta: 0.001
+
+  # Checkpointing
+  save_freq: 200              # 16 局内不触发，保持默认
+  eval_freq: 8                # DEBUG：ep8 之后立刻进入 eval
+  eval_episodes: 20           # DEBUG：两 rank 各 10 局（约 15min）；想验证真实 70/70 改回 140
+
+# ── Skill Library ─────────────────────────────────────────────────────────────
+skill_library:
+  top_k_task: 6               # K: task-specific skills retrieved per step (SkillRL K=6)
+  max_skills: 200             # hard cap on library size
+  skill_gen_batch: 5          # trajectories fed to Qwen per skill-generation call
+  success_reward_threshold: 7.0  # reward >= 此值的成功轨迹才收集去生成新技能
+
+# ── Device ────────────────────────────────────────────────────────────────────
+device: "cuda"
+seed: 42
