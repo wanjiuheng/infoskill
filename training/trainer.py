@@ -486,6 +486,12 @@ class InfoskillTrainer:
         #    regardless of N or how many mini-batches it took.
         batch_size = self.mini_batch_size
         n_mini_batches = -(-N // batch_size)  # ceil(N / batch_size), rank-local
+        # DDP 诊断：N/zero_var/n_mini 都是 rank 局部的量，打印出来便于对比两
+        # rank 是否在某轮分歧。死锁重演时这些行能定位错位发生在哪一轮。
+        logger.info(
+            "[DDP-DIAG] rank=%d ep=%d enter fast_update N=%d zero_var=%s n_mini=%d",
+            self.rank, self._episode_count, N, zero_variance_group, n_mini_batches,
+        )
         self.optimizer.zero_grad()  # 清空梯度，准备累加
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）
@@ -583,6 +589,13 @@ class InfoskillTrainer:
             g_loss_accum += (g_b.item() if isinstance(g_b, torch.Tensor) else g_b) * B
             num_batches += B
 
+        # DDP 诊断：mini-batch 循环完成（最后一次 DDP allreduce 已发出）。
+        # 若某 rank 卡在循环内（未打此行）而另一 rank 已打出 → 错位在循环内。
+        if self.is_ddp:
+            logger.info(
+                "[DDP-DIAG] rank=%d ep=%d mini-batch loop done", self.rank, self._episode_count
+            )
+
         # 5. In DDP mode, sync auxiliary-module gradients across ranks.
         # encoder/prior_net/projector/reward_predictor/grounding_decoder are
         # plain nn.Modules, never wrapped in DDP (only self.model, the LLM, is)
@@ -599,9 +612,23 @@ class InfoskillTrainer:
             ]
             for m in aux_modules:
                 for p in m.parameters():
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-                        p.grad /= self.world_size
+                    # 之前 `if p.grad is not None` 是 rank 局部条件：若某 rank 的
+                    # 某参数 backward 未触达（grad=None），它跳过这次 allreduce，
+                    # 而另一个 rank 仍执行 → 两 rank 每轮 collective 数永久错位
+                    # → NCCL 死锁（同序号 numel 不匹配，互相等待到超时）。防御：
+                    # None 补成零张量再 all_reduce，保证每个 rank 每轮发出的
+                    # allreduce 数量严格一致。warn 保留用于确认死锁是否由此引发。
+                    if p.grad is None:
+                        logger.warning(
+                            "[DDP-DIAG] rank=%d %s grad is None (numel=%d), "
+                            "allreduce 补零", self.rank, m.__class__.__name__, p.numel()
+                        )
+                        p.grad = torch.zeros_like(p.data)
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                    p.grad /= self.world_size
+            logger.info(
+                "[DDP-DIAG] rank=%d ep=%d aux allreduce done", self.rank, self._episode_count
+            )
 
         # 6. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）
         nn.utils.clip_grad_norm_(self._all_params(), self.grad_clip)
