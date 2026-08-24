@@ -84,6 +84,15 @@ class AlfworldTextEnv(BaseEnvWrapper):
         self._task_type: str = "pick_and_place"
         self._step_count: int = 0
 
+        # ── 探索新颖度奖励状态（GRPO 零方差修复）──────────────────────────────
+        # 组内 4 局 reward 全为 0 时（全失败）GRPO advantage 全 0 → policy 无梯度。
+        # 这里给"失败但探索深入"的轨迹额外奖励，制造组内 reward 方差。
+        # _seen_tokens:  本局已见过的 obs token 集合（按单词）
+        # _used_explore: 本局累计已发放的探索奖励（封顶 _explore_budget）
+        self._seen_tokens: set  = set()
+        self._used_explore: float = 0.0
+        self._explore_budget: float = 2.0   # 整个 episode 探索奖励累计上限
+
         self._init_env()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -153,6 +162,8 @@ class AlfworldTextEnv(BaseEnvWrapper):
         """
         obs_list, infos = self._env.reset()
         self._step_count = 0
+        self._seen_tokens = set()          # 新 episode 重置探索状态
+        self._used_explore = 0.0
 
         obs_text: str = obs_list[0] if isinstance(obs_list, (list, tuple)) else obs_list
 
@@ -189,12 +200,16 @@ class AlfworldTextEnv(BaseEnvWrapper):
         won: bool = bool(infos.get("won", [False])[0])
         done: bool = bool(dones_list[0]) or (self._step_count >= self._max_steps)
 
-        # Reward shaping: 基础成功奖励 10.0，减去步数惩罚（每步 -0.1）
-        # 鼓励更短、更高效的轨迹；失败则 reward=0.0
+        # Reward shaping（GRPO 零方差修复）：
+        #   成功: 10.0 − 0.1·steps + 探索奖励   （鼓励短且探索充分的成功）
+        #   失败: −0.1·steps + 探索奖励        （不再全 0——失败但探索深入的轨迹
+        #         reward 更高 → 组内 std>0 → GRPO advantage 非零 → policy 有梯度）
+        # 探索奖励上限 2.0 ≪ 成功 10.0，不会诱导策略只刷探索分而放弃任务。
+        explore = self._explore_reward(obs_text)
         if won:
-            reward = 10.0 - 0.1 * self._step_count
+            reward = 10.0 - 0.1 * self._step_count + explore
         else:
-            reward = 0.0
+            reward = -0.1 * self._step_count + explore
 
         admissible: List[str] = self._get_admissible(infos)
         info = {
@@ -212,6 +227,26 @@ class AlfworldTextEnv(BaseEnvWrapper):
         return self._task_desc
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _explore_reward(self, obs_text: str) -> float:
+        """
+        探索新颖度奖励：本步 obs 相对本局已见过的内容有多少"新信息"。
+
+        按单词切分 obs 文本，计算本轮新增 token 数占本轮总 token 数的比例。
+        走到新房间/新看到物体 → 新 token 多 → novelty 高；原地 look 看到同一
+        段文本 → novelty 低。整个 episode 累计探索奖励封顶 `_explore_budget`，
+        保证成功奖励（10.0）始终主导，不会诱导策略只刷探索分。
+        """
+        toks = set(re.findall(r"[a-z0-9]+", obs_text.lower()))
+        if not toks:
+            return 0.0
+        new_toks = toks - self._seen_tokens
+        self._seen_tokens |= toks
+        novelty = len(new_toks) / len(toks)
+        inc = min(novelty, 1.0) * 0.5                     # 单步封顶 0.5
+        inc = min(inc, max(0.0, self._explore_budget - self._used_explore))
+        self._used_explore += inc
+        return inc
 
     @staticmethod
     def _gamefile_path(infos: Dict) -> str:
