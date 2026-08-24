@@ -8,11 +8,22 @@ utils/stopping_criteria.py
 - stop_strings 需要较新的 transformers 版本才支持，训练机版本不确定；
 - 显式控制检测窗口与批量语义，行为完全可控。
 
-注意：transformers 的 StoppingCriteria 是整批共享的——任一序列触发即整批
-停止。rollout 中同一批是同一 GRPO 组（同任务、同 step 同步推进），组内输出
-长度高度相似，连带截断风险很小；即使个别序列被截断，只要 </action> 已完整
-生成（这正是触发条件），parse_action 仍能提取出动作，后续 is_valid 处理逻辑
-不变。
+注意：transformers 的 StoppingCriteria 返回值是整批共享的一个布尔值——一
+旦返回 True，batch 里所有序列（包括还没写完 </action> 的）都会被同时截断
+（这是 transformers 的已知限制，见
+https://github.com/huggingface/transformers/issues/22340）。
+
+2026-08-24 debug run 实测踩到了这个坑：批内 4 个序列逐 token 同步生成
+（lockstep），一旦有序列先写完 </action>（哪怕只有 1 条），就把同批里还在
+写 think/action 的其它序列全部腰斩在词中间（如 "go to countertop" 缺
+"1</action>"、"navigate to the sidetable, (" 断在括号里）。这些被腰斩的
+序列 parse_action 解析不出合法 <action>，判 is_valid=False，导致那次 run
+120 条 step 里只有 30 条（25%）进入 update——训练信号被砍掉四分之三。
+
+修复：改成"批内全部序列都已生成 </action>"才停（all 语义，而非 any）。
+这样不会有任何序列被过早截断，只是当批内最慢的那条也写完动作后，才把
+多余的收尾 token 一起省掉——退化到"不省"的最坏情况就是等于没加这个优化，
+但绝不会牺牲正确性。
 """
 
 from __future__ import annotations
@@ -38,12 +49,13 @@ class _StopAtActionEnd(StoppingCriteria):
 
     def __call__(self, input_ids, scores, **kwargs: Any) -> bool:
         # input_ids: [batch, cur_len]，只看每个序列最近 window 个 token 的文本。
-        # 任一序列检测到 stop_str → 整批停止（transformers 语义）。
+        # 必须批内所有序列都已生成 </action> 才停止（all 语义）——只要有一条
+        # 还没写完，就继续生成，避免把它腰斩在词中间（is_valid 会判它无效）。
         recent = input_ids[:, -self.window:]
         for row in recent:
-            if self.stop_str in self.tokenizer.decode(row, skip_special_tokens=True):
-                return True
-        return False
+            if self.stop_str not in self.tokenizer.decode(row, skip_special_tokens=True):
+                return False
+        return True
 
 
 def build_action_stop_criteria(tokenizer) -> StoppingCriteriaList:
