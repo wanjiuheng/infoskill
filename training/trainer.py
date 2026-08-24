@@ -87,10 +87,10 @@ class InfoskillTrainer:
         world_size:         int = 1,       # DDP world size
     ) -> None:
         self.model             = model
-        # Unwrapped model reference for accessing HF methods (get_input_embeddings,
-        # generate, save_pretrained) that DDP doesn't forward. forward/backward
-        # still go through self.model (the DDP wrapper) for gradient sync.
-        self._base_model        = model.module if is_ddp else model
+        # DDP 模式下模型不 wrap（见 train.py 注释），self.model 即原始模型；
+        # self._base_model 保留作 HF 方法（get_input_embeddings/generate/
+        # save_pretrained）的入口，与 self.model 是同一对象。
+        self._base_model        = model
         self.tokenizer         = tokenizer
         self.encoder           = encoder
         self.prior_net         = prior_net
@@ -470,20 +470,14 @@ class InfoskillTrainer:
         #    self.mini_batch_size（training.mini_batch_size）是每次 forward +
         #    backward 的 step 数量，可根据显存调整；越小越省显存。
         #
-        #    DDP note: N (active_records count) is rank-local — it depends on
-        #    each rank's own rollout sampling (is_valid filtering), so the two
-        #    ranks' number of mini-batches, ceil(N/batch_size), can differ.
-        #    self.model is DDP-wrapped, and DDP's default behavior triggers a
-        #    gradient all-reduce on every backward() — if one rank calls
-        #    backward() more times than the other in this loop, their
-        #    collective-op sequences diverge and NCCL deadlocks (each rank
-        #    waits for a collective the other rank never issues). Fix: wrap
-        #    every backward() except the last mini-batch in self.model.no_sync()
-        #    (accumulates gradients locally, skips the all-reduce); only the
-        #    final backward() syncs, and it captures the full accumulated
-        #    gradient (still the same .grad tensors). This makes each rank
-        #    contribute exactly one all-reduce per _fast_update call, always,
-        #    regardless of N or how many mini-batches it took.
+        #    DDP: N（active_records 数）是 rank 局部的，两 rank 的 mini-batch 数
+        #    ceil(N/batch_size) 可以不同。模型不包 DDP（train.py 注释），backward
+        #    不触发任何梯度 allreduce —— 观察证实 torch 2.6 下 DDP.no_sync() 无法
+        #    抑制每个 mini-batch 的梯度 allreduce，一旦两 rank backward 次数错位，
+        #    collective 序就永久错位死锁（run 20260824，seq142 处 rank0=6602752
+        #    LoRA 桶 vs rank1=512 aux，前 141 个 collective 均正确配对）。
+        #    梯度同步改为：循环后对 LoRA + aux 所有可训练参数手动 all_reduce 一次
+        #    （下方第 5 步），每 rank 每轮发出严格相同的 collective 数，与 N 无关。
         batch_size = self.mini_batch_size
         n_mini_batches = -(-N // batch_size)  # ceil(N / batch_size), rank-local
         # DDP 诊断：N/zero_var/n_mini 都是 rank 局部的量，打印出来便于对比两
@@ -506,7 +500,6 @@ class InfoskillTrainer:
             batch_records = active_records[i : i + batch_size]
             batch_adv = advantages[i : i + batch_size]  # [B]
             B = len(batch_records)
-            is_last_mini_batch = (bi == n_mini_batches - 1)
 
             # ── 4a. 重新计算 encoder forward（带梯度）──────────────────────────
             state_embs_b = torch.stack(
@@ -571,15 +564,10 @@ class InfoskillTrainer:
 
             # ── 4h. Backward（梯度累加）────────────────────────────────────────
             # 注意：不调用 optimizer.zero_grad()，这样梯度会累加到之前的 mini-batch
-            # DDP: only the last mini-batch's backward() triggers the gradient
-            # all-reduce (see comment above the loop); earlier ones accumulate
-            # locally via no_sync() so every rank does exactly one all-reduce
-            # per call regardless of how many mini-batches it ran.
-            if self.is_ddp and not is_last_mini_batch:
-                with self.model.no_sync():
-                    total_b.backward()
-            else:
-                total_b.backward()
+            # 模型不包 DDP，backward 不触发任何 collective；循环结束后统一对
+            # LoRA 梯度做一次 all_reduce（下方第 5 步），因此各 rank 可自由跑
+            # 不同的 mini-batch 数而不影响 collective 序。
+            total_b.backward()
 
             # 累积 loss 用于日志（按 batch size 加权平均）
             total_loss_accum += total_b.item() * B
@@ -589,35 +577,41 @@ class InfoskillTrainer:
             g_loss_accum += (g_b.item() if isinstance(g_b, torch.Tensor) else g_b) * B
             num_batches += B
 
-        # DDP 诊断：mini-batch 循环完成（最后一次 DDP allreduce 已发出）。
-        # 若某 rank 卡在循环内（未打此行）而另一 rank 已打出 → 错位在循环内。
+        # DDP 诊断：mini-batch 循环完成。循环内无 collective，若某 rank 卡在循环内
+        # （未打此行）说明是计算/显存问题而非 collective 错位。
         if self.is_ddp:
             logger.info(
                 "[DDP-DIAG] rank=%d ep=%d mini-batch loop done", self.rank, self._episode_count
             )
 
-        # 5. In DDP mode, sync auxiliary-module gradients across ranks.
-        # encoder/prior_net/projector/reward_predictor/grounding_decoder are
-        # plain nn.Modules, never wrapped in DDP (only self.model, the LLM, is)
-        # — so unlike the LLM their gradients were never cross-rank synced;
-        # each rank was silently training its own diverging copy. Doing this
-        # here (once, after the mini-batch loop, before optimizer.step()) is
-        # safe regardless of how many mini-batches each rank ran: every rank
-        # reaches this line exactly once per _fast_update() call.
+        # 5. DDP: 手动同步梯度。模型不包 DDP，backward 不触发自动 allreduce
+        #    （见 train.py 注释），因此 LoRA（self.model 可训练参数）与 aux 模块
+        #    的梯度都在这里统一 all_reduce 一次。每 rank 每轮严格经过同样数量的
+        #    allreduce，collective 数与 N / mini-batch 数无关，从根上杜绝错位。
+        #    grad=None 补零是防御性处理：保证两 rank 发出的 allreduce 数量严格
+        #    一致，防止 rank 局部条件造成错位。warn 保留用于确认是否出现。
         if self.is_ddp:
             import torch.distributed as dist
             aux_modules = [
                 self.encoder, self.prior_net, self.projector,
                 self.reward_predictor, self.grounding_decoder,
             ]
+            n_lora = 0
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    logger.warning(
+                        "[DDP-DIAG] rank=%d LoRA %s grad is None (numel=%d), "
+                        "allreduce 补零", self.rank, name, p.numel()
+                    )
+                    p.grad = torch.zeros_like(p.data)
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad /= self.world_size
+                n_lora += 1
+            n_aux = 0
             for m in aux_modules:
                 for p in m.parameters():
-                    # 之前 `if p.grad is not None` 是 rank 局部条件：若某 rank 的
-                    # 某参数 backward 未触达（grad=None），它跳过这次 allreduce，
-                    # 而另一个 rank 仍执行 → 两 rank 每轮 collective 数永久错位
-                    # → NCCL 死锁（同序号 numel 不匹配，互相等待到超时）。防御：
-                    # None 补成零张量再 all_reduce，保证每个 rank 每轮发出的
-                    # allreduce 数量严格一致。warn 保留用于确认死锁是否由此引发。
                     if p.grad is None:
                         logger.warning(
                             "[DDP-DIAG] rank=%d %s grad is None (numel=%d), "
@@ -626,8 +620,10 @@ class InfoskillTrainer:
                         p.grad = torch.zeros_like(p.data)
                     dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                     p.grad /= self.world_size
+                    n_aux += 1
             logger.info(
-                "[DDP-DIAG] rank=%d ep=%d aux allreduce done", self.rank, self._episode_count
+                "[DDP-DIAG] rank=%d ep=%d grad allreduce done (lora=%d aux=%d)",
+                self.rank, self._episode_count, n_lora, n_aux,
             )
 
         # 6. Gradient clipping + optimizer step（所有 mini-batch 的梯度已累加）

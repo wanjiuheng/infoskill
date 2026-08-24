@@ -203,19 +203,13 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # In DDP mode, wrap with DistributedDataParallel.
-    # broadcast_buffers=False: skip the per-forward buffer broadcast — LoRA+Qwen2
-    # has no buffers that need cross-rank sync (RMSNorm has no running stats),
-    # and each rank's _fast_update() mini-batch loop calls this model's forward()
-    # a different number of times (active_records count N differs per rank), so
-    # the default per-forward broadcast would deadlock once rank forward counts
-    # diverge (see no_sync() usage in trainer.py's _fast_update).
-    if is_ddp:
-        from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[device.index], output_device=device.index,
-                    broadcast_buffers=False)
-        logger.info("Wrapped model with DDP (broadcast_buffers=False)")
-    else:
+    # DDP 模式下不包 DistributedDataParallel。观察证实（run 20260824, torch 2.6）
+    # no_sync() 无法抑制每个 mini-batch backward 触发的梯度 allreduce，而各 rank
+    # 的 active records 数 N 不同 → backward 次数不同，两 rank 的 collective 序
+    # 永久错位，NCCL 必然死锁。改为完全手动同步：初始权重由 train.py main()
+    # 从 rank0 广播；_fast_update() 循环后对 LoRA 梯度手动 all_reduce 一次
+    # （trainer.py 第 5 步），collective 数与 N / mini-batch 数彻底无关。
+    if not is_ddp:
         model = model.to(device)
 
     # Trade compute for memory: without this, the full-sequence forward pass in
@@ -225,7 +219,7 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
     # required alongside it — with a frozen base model + inputs_embeds (not
     # input_ids), gradient checkpointing otherwise can't recompute activations
     # on the backward pass because the checkpointed input doesn't require grad.
-    base_model = model.module if is_ddp else model
+    base_model = model
     base_model.gradient_checkpointing_enable()
     base_model.enable_input_require_grads()
 
@@ -413,9 +407,23 @@ def main():
     # Build fast modules
     encoder, prior_net, projector, reward_predictor, grounding_decoder = build_fast_modules(cfg, device)
 
+    # DDP: 初始权重从 rank0 广播（不包 DDP 后没有构造期广播）。set_seed(seed+rank)
+    # 按 rank 播种 → LoRA 与 aux 模块每 rank 随机初始化不同；不同步则各 rank 从
+    # 不同起点训练，即使梯度 allreduce 后也永久保持初始偏移分叉。之前只有 LoRA
+    # 被 DDP 构造器广播，aux 模块从未同步（潜在分叉 bug），这里一并修复。
+    if is_ddp:
+        for p in model.parameters():
+            if p.requires_grad:
+                dist.broadcast(p.data, src=0)
+        for m in (encoder, prior_net, projector, reward_predictor, grounding_decoder):
+            for p in m.parameters():
+                if p.requires_grad:
+                    dist.broadcast(p.data, src=0)
+        logger.info("Broadcast initial trainable weights from rank 0 (LoRA + aux)")
+
     # Build skill library - need to pass the base model (unwrapped)
     from skill_library.library import SkillLibrary
-    base_model = model.module if is_ddp else model
+    base_model = model
     skill_lib = SkillLibrary(
         json_path=cfg["paths"]["skills_json"],
         model=base_model,
