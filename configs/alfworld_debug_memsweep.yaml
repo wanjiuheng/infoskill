@@ -1,0 +1,68 @@
+# InfoSkill ALFWorld 配置 —— DEBUG 专用（mini_batch_size 显存 sweep）
+# 用法：不要直接用这个文件跑 train.py —— __MBS__ 是占位符，由
+# scripts/mbs_sweep.sh 用 sed 替换成具体的 mini_batch_size 值后生成临时
+# yaml 再跑。目的只是测 update 阶段峰值显存随 mini_batch_size 的变化，
+# 不是正式训练：eval_freq 设得很大保证不触发 eval，8 个 episode 跑完即结束。
+#
+# 与 alfworld.yaml 的差异：
+#   num_episodes: 8      → 跑 2 组 rollout+update 就结束（第 1 组热身，
+#                           第 2 组的 update 窗口用来读显存峰值）
+#   eval_freq:    1000   → 不触发 eval，专注测 update 阶段
+#   mini_batch_size: __MBS__ → 由 sweep 脚本替换
+
+paths:
+  alfworld_config: "envs/alfworld_base_config.yaml"
+  skills_json: "skill_library/data/claude_style_skills.json"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+
+model:
+  backbone: "/HOME/hfut_tlzhang/hfut_tlzhang_2/HDD_POOL/ztl/wjh/models/Alfworld-7B-SFT/checkpoint-140"
+  hidden_size: 3584
+  lora:
+    r: 16
+    lora_alpha: 32
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    lora_dropout: 0.05
+    bias: "none"
+
+fast:
+  latent_dim: 64
+  num_prefix: 8
+  grounding_hidden_dim: 512
+  grounding_max_len: 64
+
+loss:
+  alpha1: 0.1
+  alpha2: 0.01
+  beta: 0.001
+
+rollout:
+  group_size: 4
+  max_steps: 30
+  max_new_tokens: 512
+  max_prompt_len: 8192
+  temperature: 0.9
+  top_p: 0.9
+  history_len: 3
+
+training:
+  num_episodes: 8
+  learning_rate: 1.0e-6
+  grad_clip: 1.0
+  batch_accumulation: 1
+  mini_batch_size: __MBS__
+  slow_update_interval: 200
+  mig_beta: 0.001
+  save_freq: 200
+  eval_freq: 1000
+  eval_episodes: 20
+
+skill_library:
+  top_k_task: 6
+  max_skills: 200
+  skill_gen_batch: 5
+  success_reward_threshold: 7.0
+
+device: "cuda"
+seed: 42
