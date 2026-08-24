@@ -175,6 +175,7 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",   # FA2：加速 rollout + update 前向/反向
             trust_remote_code=True,
         )
         model = model.to(device)
@@ -182,6 +183,7 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",   # FA2：加速 rollout + update 前向/反向
             device_map="auto",
             trust_remote_code=True,
         )
