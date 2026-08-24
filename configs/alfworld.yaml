@@ -34,6 +34,7 @@ loss:
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
   group_size: 4               # G: parallel episodes per task
+  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
   max_steps: 30                # max steps per episode
   max_new_tokens: 512         # LLM generation budget per step
   max_prompt_len: 8192        # per-step prompt hard cap (tokenizer max_length);
@@ -62,11 +63,13 @@ training:
   mig_beta: 0.001             # beta used in MIG = Fidelity - beta*Rate for pruning
 
   # Checkpointing
-  save_freq: 200              # save checkpoint every N episodes (must be multiple of
-                                # rollout.group_size=4 or the modulo never hits 0)
-  eval_freq: 200              # run eval every N episodes (must be a multiple of
-                                # rollout.group_size, or episode_count % eval_freq
-                                # never hits 0 and eval silently never runs)
+  save_freq: 200              # save checkpoint every N episodes（每轮 episode 增量 =
+                                # group_size × tasks_per_batch × world_size；阈值用
+                                # "越过即触发"，所以只要不是增量更小的频繁值就不会
+                                # 卡住，实际触发点可能比 N 稍晚几个 episode）
+  eval_freq: 200              # run eval every N episodes（同上；"必须是 group_size
+                                # 倍数"的旧描述是早期 % 判断的遗留，阈值式判断下
+                                # 不受整除约束，但增量跨度应 < N 否则会跳过）
   eval_episodes: 140          # episodes for evaluation run (eval_in_distribution 共 140 个游戏)
 
 # ── Skill Library ─────────────────────────────────────────────────────────────

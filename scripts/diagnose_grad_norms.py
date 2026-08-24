@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 import yaml
 
-from training.grpo import compute_grpo_advantages
+from training.grpo import compute_grpo_advantages_grouped
 from training.losses import (
     compute_policy_loss, compute_fidelity_loss, compute_rate_loss,
 )
@@ -114,7 +114,7 @@ def main():
         for _ in range(G)
     ]
     collector = GroupRolloutCollector(
-        envs=envs, model=model, tokenizer=tokenizer,
+        task_groups=[envs], model=model, tokenizer=tokenizer,
         encoder=encoder, projector=projector, skill_lib=skill_lib,
         device=device, cfg=cfg.get("rollout", {}), action_logger=None,
         success_reward_threshold=trainer.success_reward_threshold,
@@ -124,7 +124,7 @@ def main():
     for env in envs:
         env.close()
 
-    adv_per_ep = compute_grpo_advantages(buf.total_rewards)
+    adv_per_ep = compute_grpo_advantages_grouped(buf.total_rewards, buf.group_size)
     active = [r for r in buf.records if not r.is_padding and r.is_valid]
     logger.info("Group rewards: %s  | success=%d/%d | active records=%d",
                 [round(float(r), 2) for r in buf.total_rewards],

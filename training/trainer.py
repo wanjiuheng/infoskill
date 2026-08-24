@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from training.rollout import GroupRolloutCollector, TrajectoryBuffer, StepRecord
-from training.grpo import compute_grpo_advantages
+from training.grpo import compute_grpo_advantages_grouped
 from training.losses import compute_total_loss
 from envs.alfworld_env import AlfworldTextEnv
 from models.encoder import StateConditionalEncoder, PriorNetwork
@@ -124,6 +124,11 @@ class InfoskillTrainer:
         self.save_freq       = tcfg.get("save_freq", 100)
         self.eval_freq       = tcfg.get("eval_freq", 50)
         self.G               = rcfg.get("group_size", 8)
+        # tasks_per_batch: 一批 rollout 同时跑几个不同任务（默认1=原行为，
+        # 每批只有一个 GRPO 组）。self.G 保持表示单个 GRPO 组的局数不变；
+        # 凡是需要"这一轮总局数"的地方都显式写 self.G * self.tasks_per_batch，
+        # 不引入第三个变量名。
+        self.tasks_per_batch = rcfg.get("tasks_per_batch", 1)
         self.num_episodes    = tcfg.get("num_episodes", 5000)
         # _fast_update() 里每次 forward+backward 重算 log_prob 的 mini-batch 大小
         # （不是 rollout.group_size，那是每组并行跑几局任务，语义不同）
@@ -219,10 +224,14 @@ class InfoskillTrainer:
 
         # resume 时 self._episode_count 是从 checkpoint 读回来的非零值，
         # 反推出应该从第几组继续（episode_count 与 group_idx 存在确定性的
-        # 线性关系：episode_count = group_idx * G * world_size），这样 resume
-        # 后不会把 group_idx=0 对应的任务重新喂给模型一遍。
-        group_idx = self._episode_count // (self.G * self.world_size)
-        envs: Optional[List[AlfworldTextEnv]] = None
+        # 线性关系：episode_count = group_idx * G * tasks_per_batch * world_size），
+        # 这样 resume 后不会把 group_idx=0 对应的任务重新喂给模型一遍。
+        group_idx = self._episode_count // (
+            self.G * self.tasks_per_batch * self.world_size
+        )
+        # 每个任务组一份 env 列表（首次为 None，构造一次后只 reseed 复用；
+        # AlfredTWEnv 构造要重扫 train split 全部目录，是最贵的单项开销）。
+        envs_by_task: List[Optional[List[AlfworldTextEnv]]] = [None] * self.tasks_per_batch
         start_time = time.time()
 
         # 创建进度条
@@ -235,23 +244,31 @@ class InfoskillTrainer:
         )
 
         while self._episode_count < self.num_episodes:
-            # ── Get G envs for this group (same task family, different seeds)
-            # 不同 rank 取不同的 seed 块（rank 维度分片），同一 rank 组内 G 个 env
-            # 仍共享 seed（GRPO 要求组内同任务）。这样 N 卡一轮 = G*N 个不同任务。
-            seed = (group_idx * self.world_size + self.rank) * self.G
-            if envs is None:
-                # 只在整个训练/resume 生命周期内构造一次 AlfredTWEnv（每次构造都
-                # 要重扫 train split 下全部目录，是当前最大的单项耗时开销）。
-                # 之后每组只 reseed，复用已建好的 env 对象。
-                envs = train_envs_factory(seed)
-                assert len(envs) == self.G, f"Expected {self.G} envs, got {len(envs)}"
-            else:
-                for env in envs:
-                    env.reseed(seed)
+            # ── 构造本轮的 task_groups（任务组 × group_size 个 env）────────────
+            # 每个 rank 每轮占用 tasks_per_batch 个不同任务的 seed 段（rank 维度
+            # 分片保证不同 rank 不撞任务）；同一任务组内 group_size 个 env 共享
+            # seed（GRPO 要求组内同任务）。这样 N 卡一轮 = G × tasks_per_batch × N
+            # 个不同任务。
+            seed_base = (group_idx * self.world_size + self.rank) * self.tasks_per_batch
+            task_groups: List[List[AlfworldTextEnv]] = []
+            for t in range(self.tasks_per_batch):
+                seed = (seed_base + t) * self.G
+                if envs_by_task[t] is None:
+                    # 只在整个训练/resume 生命周期内构造一次 AlfredTWEnv（每次
+                    # 构造都要重扫 train split 下全部目录，是最大的单项耗时开销）。
+                    # 之后每组只 reseed，复用已建好的 env 对象。
+                    envs_by_task[t] = train_envs_factory(seed)
+                    assert len(envs_by_task[t]) == self.G, (
+                        f"Expected {self.G} envs per task group, got {len(envs_by_task[t])}"
+                    )
+                else:
+                    for env in envs_by_task[t]:
+                        env.reseed(seed)
+                task_groups.append(envs_by_task[t])
 
             # ── Rollout ───────────────────────────────────────────────────────
             collector = GroupRolloutCollector(
-                envs=envs,
+                task_groups=task_groups,
                 model=self._base_model,  # 解包模型（rollout 需要 get_input_embeddings/generate）
                 tokenizer=self.tokenizer,
                 encoder=self.encoder,
@@ -267,8 +284,8 @@ class InfoskillTrainer:
             # ── Fast Module update ────────────────────────────────────────────
             loss_dict = self._fast_update(buf)
 
-            # episode_count 反映全局进度：N 卡一轮 = G*N 个 episode
-            self._episode_count += self.G * self.world_size
+            # episode_count 反映全局进度：N 卡一轮 = G*tasks_per_batch*N 个 episode
+            self._episode_count += self.G * self.tasks_per_batch * self.world_size
             group_idx += 1
             step_count = sum(1 for r in buf.records if not r.is_padding)
             # 不同 rank 任务步数可能不同 → global_step 用 all_reduce 同步，
@@ -282,8 +299,9 @@ class InfoskillTrainer:
             self._global_step += step_count
 
             # ── Logging ───────────────────────────────────────────────────────
-            sr = sum(1 for r in buf.total_rewards if r >= 1.0) / self.G  # 任务完成率（不考虑步数）
-            avg_steps = sum(buf.total_steps) / self.G  # 平均步数
+            total_ep = self.G * self.tasks_per_batch  # 本轮总局数
+            sr = sum(1 for r in buf.total_rewards if r >= 1.0) / total_ep  # 任务完成率（不考虑步数）
+            avg_steps = sum(buf.total_steps) / total_ep  # 平均步数
             logger.info(
                 "Episode %d | group %d | success_rate=%.2f | avg_steps=%.1f | "
                 "loss=%.4f p=%.4f f=%.4f r=%.4f g=%.4f | skills=%d",
@@ -313,8 +331,8 @@ class InfoskillTrainer:
                 "avg_steps": avg_steps,
             })
 
-            # 更新进度条（全局进度 = G * world_size）
-            pbar.update(self.G * self.world_size)
+            # 更新进度条（全局进度 = G * tasks_per_batch * world_size）
+            pbar.update(self.G * self.tasks_per_batch * self.world_size)
             elapsed = time.time() - start_time
             avg_time_per_ep = elapsed / self._episode_count if self._episode_count > 0 else 0
             remaining_eps = self.num_episodes - self._episode_count
@@ -401,9 +419,10 @@ class InfoskillTrainer:
 
         logger.info("Training complete after %d episodes.", self._episode_count)
         pbar.close()
-        if envs is not None:
-            for env in envs:
-                env.close()
+        for group_envs in envs_by_task:
+            if group_envs is not None:
+                for env in group_envs:
+                    env.close()
         if self.rank == 0:
             self.save_checkpoint(final=True)
 
@@ -424,8 +443,14 @@ class InfoskillTrainer:
             loss_dict: {"total", "policy", "fidelity", "rate", "grounding"}
         """
 
-        # 1. 计算 GRPO advantages（每个 episode 一个标量）
-        advantages_per_ep = compute_grpo_advantages(buf.total_rewards)  # [G]
+        # 1. 计算 GRPO advantages。buf 可能跨多个任务组（tasks_per_batch>1），
+        #    必须按组（buf.group_size 个 episode）分别归一化，否则任务难度差异
+        #    会混入 advantage（同组任务不一致的问题）。
+        gs = buf.group_size
+        assert gs > 0, "buf.group_size 未设置（rollout 未正确填充）"
+        advantages_per_ep = compute_grpo_advantages_grouped(
+            buf.total_rewards, gs
+        )  # [G_total]
 
         # 2. 过滤出有效的 records（排除 padding placeholders + 无效动作）
         #    is_valid=False 表示动作无法解析（无 <action> 标签、action 内容为空
@@ -465,8 +490,17 @@ class InfoskillTrainer:
         # 退化成常数预测器 → MIG 剪枝的 fidelity 项失去区分度。这些组跳过
         # fidelity 监督（policy 项因 advantage=0 天然无梯度，不受影响；rate 是
         # 压缩正则、与方差无关，照常计算）。
-        rewards_t = torch.as_tensor(buf.total_rewards, dtype=torch.float32)
-        zero_variance_group = bool(rewards_t.std(unbiased=False) < 1e-6)
+        # 多任务时按组分别判断：一个任务零方差不影响另一个任务的 fidelity
+        # 监督（tasks_per_batch=1 时退化成原来的单个全局判断）。
+        zero_variance_per_group = [
+            bool(torch.as_tensor(buf.total_rewards[i:i+gs]).std(unbiased=False) < 1e-6)
+            for i in range(0, len(buf.total_rewards), gs)
+        ]
+        # 按 ep_idx 展开成逐 episode 的标记，供 fidelity_mask_full 查表用
+        zero_variance_per_ep = [
+            zero_variance_per_group[ep_idx // gs]
+            for ep_idx in range(len(buf.total_rewards))
+        ]
 
         # 3. Prepare advantage tensor broadcast to each step
         adv_list = [advantages_per_ep[r.ep_idx] for r in active_records]
@@ -488,11 +522,22 @@ class InfoskillTrainer:
         n_mini_batches = -(-N // batch_size)  # ceil(N / batch_size), rank-local
         # DDP 诊断：N/zero_var/n_mini 都是 rank 局部的量，打印出来便于对比两
         # rank 是否在某轮分歧。死锁重演时这些行能定位错位发生在哪一轮。
+        # zero_var 现在是逐组的列表（[True, False] 表示任务A零方差、任务B非零），
+        # %s 直接打列表，信息更完整（能看出具体哪个任务零方差）。
         logger.info(
             "[DDP-DIAG] rank=%d ep=%d enter fast_update N=%d zero_var=%s n_mini=%d",
-            self.rank, self._episode_count, N, zero_variance_group, n_mini_batches,
+            self.rank, self._episode_count, N, zero_variance_per_group, n_mini_batches,
         )
         self.optimizer.zero_grad()  # 清空梯度，准备累加
+
+        # fidelity_mask：零方差组的 step 置 0，跳过 fidelity 监督。在 mini-batch
+        # 循环外按 active_records 的 ep_idx 一次性构造逐 record 的 full mask
+        # （长度 N），循环里像 advantages 一样按 [i:i+batch_size] 切片取用；
+        # mini-batch 可以跨任务组混合，不需要按任务边界对齐。
+        fidelity_mask_full = torch.tensor(
+            [0.0 if zero_variance_per_ep[r.ep_idx] else 1.0 for r in active_records],
+            device=self.device, dtype=torch.float32,
+        )  # [N]
 
         # 累积各项 loss 用于日志（从每个 mini-batch 收集）
         total_loss_accum = 0.0
@@ -547,11 +592,9 @@ class InfoskillTrainer:
             grounding_loss_b = self._compute_grounding_loss(batch_records)
 
             # ── 4g. 计算 total loss（这个 mini-batch）───────────────────────
-            # fidelity_mask：零方差组的所有步置 0，跳过 fidelity 监督
-            fidelity_mask_b = (
-                torch.zeros(B, device=self.device, dtype=torch.float32)
-                if zero_variance_group else None
-            )
+            # fidelity_mask：从循环外构造好的 full mask 按切片取本 batch 的
+            # 部分（逐 record，零方差组的 step 为 0 → 跳过 fidelity 监督）
+            fidelity_mask_b = fidelity_mask_full[i : i + B]
             total_b, p_b, f_b, r_b, g_b = compute_total_loss(
                 log_probs=log_probs_b,
                 advantages=batch_adv,
@@ -913,6 +956,11 @@ class InfoskillTrainer:
             "optimizer":         self.optimizer.state_dict(),
             "episode_count":     self._episode_count,
             "global_step":       self._global_step,
+            # batch 组织参数：resume 时校验一致，否则 seed/group_idx 反算会
+            # 静默错位（重复/跳过任务）。老 checkpoint 无这两个字段 → load 用
+            # .get() 读 None，跳过校验保持兼容。
+            "group_size":        self.G,
+            "tasks_per_batch":   self.tasks_per_batch,
             # 运行时状态：不保存则 resume 后 MIG 评估短期失真（usage_history）、
             # 已收集成功轨迹丢失（pending_traj）、曲线/CSV 从 resume 后重画
             # （metrics/eval/steps history）。dict(...) 把 defaultdict 转普通 dict，
@@ -949,6 +997,23 @@ class InfoskillTrainer:
         self.optimizer.load_state_dict(state["optimizer"])
         self._episode_count = state["episode_count"]
         self._global_step   = state["global_step"]
+        # 校验 batch 组织参数与当前配置一致。group_idx/seed 的线性反算依赖
+        # 这两个值，resume 时改了会导致 seed 静默错位（重复或跳过任务），
+        # 因此不一致直接报错，不静默继续。老 checkpoint 无此字段 → None 跳过。
+        saved_group_size = state.get("group_size")
+        saved_tasks_per_batch = state.get("tasks_per_batch")
+        if saved_group_size is not None and saved_group_size != self.G:
+            raise ValueError(
+                f"Checkpoint 保存时 group_size={saved_group_size}，但当前配置是 "
+                f"group_size={self.G}。不同 group_size 下 resume 会让 seed/group_idx "
+                f"记账错位（重复或跳过任务），请使用与 checkpoint 一致的配置。"
+            )
+        if saved_tasks_per_batch is not None and saved_tasks_per_batch != self.tasks_per_batch:
+            raise ValueError(
+                f"Checkpoint 保存时 tasks_per_batch={saved_tasks_per_batch}，但当前配置是 "
+                f"tasks_per_batch={self.tasks_per_batch}。不同 tasks_per_batch 下 resume "
+                f"会让 seed/group_idx 记账错位，请使用与 checkpoint 一致的配置。"
+            )
         # 恢复阈值（下一个触发点 = 当前进度之后最近的一个 freq 整数倍）
         self._next_save_ep   = (self._episode_count // self.save_freq + 1) * self.save_freq
         self._next_eval_ep   = (self._episode_count // self.eval_freq + 1) * self.eval_freq

@@ -53,6 +53,7 @@ loss:
 
 rollout:
   group_size: 4            # 与事故 run 一致 —— 怀疑 batch=4 是必要条件之一，不简化
+  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
   max_steps: 3              # 30 → 3，只为缩短每组耗时，不影响崩坏机制本身
   max_new_tokens: 128        # 512 → 128，加速 decode；崩坏的信号是"每步都打满
                               # max_new_tokens"，128 一样能看出这个信号

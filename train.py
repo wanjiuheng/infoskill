@@ -106,10 +106,11 @@ def default_run_name(cfg: dict) -> str:
     mini_batch_size = tcfg.get("mini_batch_size", 10)
     max_new_tokens  = rcfg.get("max_new_tokens", 512)
     max_steps       = rcfg.get("max_steps", 50)
+    tasks_per_batch = rcfg.get("tasks_per_batch", 1)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return (
         f"lr{lr:.0e}_bs{mini_batch_size}_mnt{max_new_tokens}_ms{max_steps}"
-        f"_run_{timestamp}"
+        f"_tpb{tasks_per_batch}_run_{timestamp}"
     )
 
 

@@ -45,6 +45,7 @@ loss:
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
   group_size: 4               # G: parallel episodes per task
+  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
   max_steps: 30               # max steps per episode
   max_new_tokens: 512         # LLM generation budget per step
   max_prompt_len: 8192        # per-step prompt hard cap (tokenizer max_length)

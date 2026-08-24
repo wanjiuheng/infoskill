@@ -39,6 +39,7 @@ loss:
 
 rollout:
   group_size: 4
+  tasks_per_batch: 1               # 一批 rollout 同时跑几个不同任务（默认1=每批一个GRPO组）
   max_steps: 30
   max_new_tokens: 512
   max_prompt_len: 8192

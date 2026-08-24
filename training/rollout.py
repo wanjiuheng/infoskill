@@ -5,9 +5,17 @@ GroupRolloutCollector: runs G parallel AlfworldTextEnv instances,
 collects a full Trajectory Buffer, and returns everything needed for loss computation.
 
 Design:
-  - G envs are reset to the same task (same seed group) to form one GRPO Group.
+  - Input is `task_groups`: a list of task groups, each `group_size` envs
+    reset to the SAME task (same seed) — one GRPO Group. `task_groups` may
+    hold more than one task (rollout.tasks_per_batch > 1); all groups are
+    flattened into one batch for generate(), but each group's rewards are
+    normalised into GRPO advantages independently (see
+    InfoskillTrainer._fast_update, which slices by `buf.group_size`).
   - At each step: batch-forward through Encoder → Projector → LLM.generate().
-  - Active Mask tracks which episodes are still running.
+  - Active Mask tracks which episodes are still running — this is per-episode
+    and task-agnostic, so tasks that finish at different times (e.g. one task
+    group hits `done` well before another) are handled automatically: the
+    batch naturally shrinks to just the still-running episodes.
   - Completed episodes stop calling env.step() but stay in the batch (zero-masked).
   - Returns a TrajectoryBuffer dict ready for loss computation.
 """
@@ -77,12 +85,13 @@ class StepRecord:
 
 @dataclass
 class TrajectoryBuffer:
-    """Holds all StepRecords from one full Group rollout."""
+    """Holds all StepRecords from one full rollout (one or more task groups)."""
     records:      List[StepRecord] = field(default_factory=list)
-    total_rewards: List[float]     = field(default_factory=list)  # length G
-    total_steps:  List[int]        = field(default_factory=list)  # length G: 每个 episode 的实际步数
-    task_type:    str              = "pick_and_place"
-    task_description: str         = ""
+    total_rewards: List[float]     = field(default_factory=list)  # length G_total
+    total_steps:  List[int]        = field(default_factory=list)  # length G_total: 每个 episode 的实际步数
+    group_size:   int              = 0  # 每个 GRPO 组的局数；trainer 据此把
+                                          # total_rewards/records 按任务组切片
+                                          # 分别算 advantage（见 _fast_update）
     success_trajectories: List[Dict] = field(default_factory=list)  # for Slow Module
     task_info_per_episode: List[Dict] = field(default_factory=list)  # 每个 episode 自己的 task 信息
 
@@ -91,10 +100,19 @@ class TrajectoryBuffer:
 
 class GroupRolloutCollector:
     """
-    Manages G parallel environments and collects one full Group rollout.
+    Manages one or more GRPO task groups' environments and collects one
+    full rollout (possibly spanning multiple tasks in a single batch).
 
     Args:
-        envs:        List of G AlfworldTextEnv instances (same task, diff seeds).
+        task_groups: List of task groups. Each inner list has `group_size`
+                     AlfworldTextEnv instances reset to the SAME task (same
+                     seed) — one GRPO Group. When len(task_groups) > 1
+                     (rollout.tasks_per_batch > 1), multiple independent
+                     tasks are batched together into one generate() call for
+                     throughput, but their rewards are normalised into GRPO
+                     advantages separately by the caller (InfoskillTrainer),
+                     using `buf.group_size` to slice `buf.total_rewards`.
+                     All inner lists must have the same length.
         model:       Qwen2.5-7B-Instruct model with LoRA (on device).
         tokenizer:   Matching tokenizer.
         encoder:     StateConditionalEncoder.
@@ -108,7 +126,7 @@ class GroupRolloutCollector:
 
     def __init__(
         self,
-        envs:       List[AlfworldTextEnv],
+        task_groups: List[List[AlfworldTextEnv]],
         model,
         tokenizer,
         encoder,
@@ -119,14 +137,23 @@ class GroupRolloutCollector:
         action_logger = None,  # Optional logger for recording actions
         success_reward_threshold: float = 5.0,  # skill_library.success_reward_threshold
     ) -> None:
-        self.envs       = envs
+        assert len(task_groups) >= 1, "task_groups must have at least one task group"
+        group_size = len(task_groups[0])
+        assert all(len(g) == group_size for g in task_groups), (
+            f"每个任务组的局数必须一致，got sizes {[len(g) for g in task_groups]}"
+        )
+        self.group_size = group_size
+        # 拍平成一个扁平列表去跑 batch generate()；顺序是任务1的 group_size
+        # 个 env、任务2的 group_size 个 env、……——trainer 按同样的 group_size
+        # 切片对应回去算 GRPO advantage（见 TrajectoryBuffer.group_size）。
+        self.envs       = [env for group in task_groups for env in group]
         self.model      = model
         self.tokenizer  = tokenizer
         self.encoder    = encoder
         self.projector  = projector
         self.skill_lib  = skill_lib
         self.device     = device
-        self.G          = len(envs)
+        self.G          = len(self.envs)  # 总 batch 大小 = group_size * len(task_groups)
         self.action_logger = action_logger
         self.success_reward_threshold = success_reward_threshold
 
@@ -167,8 +194,7 @@ class GroupRolloutCollector:
             obs_list.append(obs)
             info_list.append(info)
 
-        buf.task_description = info_list[0]["task_description"]  # 保留兼容性（日志等）
-        buf.task_type        = info_list[0]["task_type"]          # 保留兼容性（日志等）
+        buf.group_size = self.group_size
         buf.task_info_per_episode = [
             {
                 "task_description": info["task_description"],
