@@ -907,6 +907,12 @@ class InfoskillTrainer:
         """
         Convert the deque-based usage_history (keyed by skill text prefix)
         into a dict keyed by skill_id, with stacked tensors.
+
+        state_emb 设备统一：_fast_update 写入时固定 .cpu()，但 load_checkpoint
+        用 map_location=self.device 恢复 checkpoint 时会把里面保存的 cpu tensor
+        搬到 cuda:0——resume 后旧 entries 在 cuda、新 entries 在 cpu，直接
+        torch.stack 会报设备不一致（Expected all tensors to be on the same
+        device, cuda:0 and cpu）。这里先逐个 .cpu() 归一化再 stack。
         """
         result = {}
         for skill in self.skill_lib:
@@ -916,7 +922,7 @@ class InfoskillTrainer:
             entries = list(self._usage_history[key])
             if not entries:
                 continue
-            state_embs = torch.stack([e[0] for e in entries]).to(self.device)
+            state_embs = torch.stack([e[0].cpu() for e in entries]).to(self.device)
             advantages = torch.tensor([e[1] for e in entries], device=self.device)
             result[skill.skill_id] = (state_embs, advantages)
         return result

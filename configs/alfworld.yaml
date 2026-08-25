@@ -59,12 +59,14 @@ training:
                                 # string, not a float — always write "1.0e-4" style.
   grad_clip: 1.0
   batch_accumulation: 1
-  mini_batch_size: 16          # bs：_fast_update() 每次 forward+backward 重算
+  mini_batch_size: 4           # bs：_fast_update() 每次 forward+backward 重算
                                 # log_prob 的 mini-batch 大小（不是 rollout.group_size）。
-                                # 训练机原用 32 实测 update 峰值 ~80GB（只剩 ~2GB 余量，
-                                # OOM 边缘）。降到 16 峰值 ~65GB 留 ~15GB 余量，且 update
-                                # 总耗时与 mbs 无关（总 FLOPs 恒定），零时间代价。tasks_per_batch
-                                # 只影响 N/耗时，不影响这里的选择。
+                                # tpb=2 双任务混批后，update 峰值 ∝ 单批条数 × batch 内
+                                # max(prompt+gen) 长度，随任务组合波动。8 在正式 run 里
+                                # 大部分轮 OK，但 eval 后遇到长序列轮次（avg 125 tok/step）
+                                # 仍 OOM（78.7GB + 4GB 碎片）。降到 4 单批激活再减半，
+                                # 配合 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+                                # 消除 eval 后碎片；update 总耗时与 mbs 无关（总 FLOPs 恒定）。
 
   # Slow module
   slow_update_interval: 200   # T: steps between library maintenance runs

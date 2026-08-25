@@ -61,7 +61,7 @@ training:
   learning_rate: 1.0e-6
   grad_clip: 1.0
   batch_accumulation: 1
-  mini_batch_size: 16          # 与正式配置一致
+  mini_batch_size: 8           # 与正式配置一致（16 在双任务下第 2 轮 update OOM，降到 8）
 
   # Slow module
   slow_update_interval: 200   # 16 局内不触发，保持默认
