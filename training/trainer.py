@@ -112,9 +112,12 @@ class InfoskillTrainer:
         rcfg = cfg.get("rollout", {})
         slcfg = cfg.get("skill_library", {})
 
-        self.alpha1  = lcfg.get("alpha1", 0.1)
+        # alpha_fidelity / alpha_rate 取代旧的耦合写法 alpha1*(fidelity+beta*rate)
+        # ——两个系数独立可关，用于消融实验（设为 0.0 即可去掉对应 loss 项）。
+        # 默认值与旧公式在不消融时数值等价：alpha_rate = 旧 alpha1×beta = 0.1×0.001。
+        self.alpha_fidelity = lcfg.get("alpha_fidelity", 0.1)
+        self.alpha_rate     = lcfg.get("alpha_rate", 0.0001)
         self.alpha2  = lcfg.get("alpha2", 0.01)
-        self.beta    = lcfg.get("beta", 0.001)
         self.mig_beta = tcfg.get("mig_beta", 0.001)
         self.grad_clip = tcfg.get("grad_clip", 1.0)
         self.slow_interval   = tcfg.get("slow_update_interval", 200)
@@ -604,9 +607,9 @@ class InfoskillTrainer:
                 prior_mu=prior_mu_b,
                 prior_log_var=prior_logvar_b,
                 grounding_loss=grounding_loss_b,
-                alpha1=self.alpha1,
+                alpha_fidelity=self.alpha_fidelity,
+                alpha_rate=self.alpha_rate,
                 alpha2=self.alpha2,
-                beta=self.beta,
                 mask=None,  # 已过滤 padding + 无效动作，不需要 mask
                 fidelity_mask=fidelity_mask_b,
             )

@@ -232,12 +232,28 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
 # ── Auxiliary modules ─────────────────────────────────────────────────────────
 
 def build_fast_modules(cfg: dict, device: torch.device):
-    """Instantiate Encoder, PriorNet, Projector, RewardPredictor, GroundingDecoder."""
+    """Instantiate Encoder, PriorNet, Projector, RewardPredictor, GroundingDecoder.
+
+    cfg["decoder_type"]（默认 "lstm"）选择 GroundingDecoder 的具体实现：
+    "lstm"（现有实现）或 "transformer"（消融实验用，2层 decoder-only
+    transformer，接口与 lstm 版完全一致，调用方无需区分）。
+    """
     from models.encoder import StateConditionalEncoder, PriorNetwork
     from models.projector import Projector
     from models.reward_predictor import RewardPredictor
-    from models.grounding_decoder import GroundingDecoder
     from transformers import AutoTokenizer
+
+    decoder_type = cfg.get("decoder_type", "lstm")
+    if decoder_type == "lstm":
+        from models.grounding_decoder import GroundingDecoder
+    elif decoder_type == "transformer":
+        from models.grounding_decoder_transformer import (
+            GroundingDecoder as GroundingDecoder,
+        )
+    else:
+        raise ValueError(
+            f"Unknown decoder_type={decoder_type!r}, expected 'lstm' or 'transformer'."
+        )
 
     state_dim  = cfg["model"]["hidden_size"]   # 3584
     skill_dim  = state_dim

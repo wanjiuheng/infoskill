@@ -142,13 +142,13 @@ def main():
         "grounding_decoder": list(grounding_decoder.parameters()),
         "lora":              [p for p in model.parameters() if p.requires_grad],
     }
-    alpha1 = trainer.alpha1
+    alpha_fidelity = trainer.alpha_fidelity
+    alpha_rate     = trainer.alpha_rate
     alpha2 = trainer.alpha2
-    beta   = trainer.beta
     term_weights = {
         "policy":   1.0,
-        "fidelity": alpha1,
-        "rate":     alpha1 * beta,
+        "fidelity": alpha_fidelity,
+        "rate":     alpha_rate,
         "grounding": alpha2,
     }
 
@@ -219,7 +219,7 @@ def main():
     # ── 输出 ────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
     print(f"Loss-balance diagnostic  checkpoint={args.checkpoint or 'fresh'}")
-    print(f"  alpha1={alpha1}  alpha2={alpha2}  beta={beta}  "
+    print(f"  alpha_fidelity={alpha_fidelity}  alpha_rate={alpha_rate}  alpha2={alpha2}  "
           f"mini_batch_size={batch_size}  groups measured={n_batches}")
     print("=" * 72)
 
@@ -244,7 +244,7 @@ def main():
     print(f"    policy path : {pol_ep:8.4f}  ({100*pol_ep/max(total_ep,1e-12):5.1f}%)")
     print(f"    aux  path   : {aux_ep:8.4f}  ({100*aux_ep/max(total_ep,1e-12):5.1f}%)")
     print(f"    ratio policy/aux = {pol_ep/max(aux_ep,1e-12):.2f}")
-    print("    (aux = alpha1*fidelity + alpha1*beta*rate + alpha2*grounding)")
+    print("    (aux = alpha_fidelity*fidelity + alpha_rate*rate + alpha2*grounding)")
     print("=" * 72)
 
 

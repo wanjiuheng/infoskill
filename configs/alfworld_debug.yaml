@@ -27,9 +27,11 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha1: 0.1                 # weight for (fidelity + beta*rate)
-  alpha2: 0.01                # weight for grounding loss
-  beta: 0.001                 # compression strength: higher = more aggressive compression
+  alpha_fidelity: 0.1          # weight for fidelity loss（消融实验设为 0.0 即可去掉）
+  alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta）
+  alpha2: 0.01                 # weight for grounding loss
+
+decoder_type: "lstm"          # "lstm"（默认）| "transformer"（消融实验用）
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:

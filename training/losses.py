@@ -4,8 +4,14 @@ training/losses.py
 All loss terms for InfoSkill (paper Eq. 8):
 
   total_loss = −policy_loss
-             + α1 × (fidelity_loss + β × rate_loss)
+             + α_fidelity × fidelity_loss + α_rate × rate_loss
              + α2 × grounding_loss
+
+  （原来是 α1 × (fidelity_loss + β × rate_loss)，α1 和 β 耦合在一起，导致
+  "只消融 fidelity" 或 "只消融 rate" 无法独立设置。拆成两个独立系数后，
+  默认值 α_fidelity=0.1, α_rate=0.0001（= 旧 α1×β = 0.1×0.001）与旧公式
+  数值完全等价，见 tests/test_loss_ablation_equivalence.py。消融某一项时
+  把对应系数设为 0 即可，不需要改代码。）
 
 Where:
   policy_loss    = E[A × log π(a|s, prefix)]       — REINFORCE / GRPO
@@ -99,9 +105,9 @@ def compute_total_loss(
     prior_mu:         torch.Tensor,
     prior_log_var:    torch.Tensor,
     grounding_loss:   torch.Tensor,
-    alpha1:           float = 0.1,
+    alpha_fidelity:   float = 0.1,
+    alpha_rate:       float = 0.0001,
     alpha2:           float = 0.01,
-    beta:             float = 0.001,
     mask:             Optional[torch.Tensor] = None,
     fidelity_mask:    Optional[torch.Tensor] = None,
 ) -> tuple:
@@ -109,6 +115,11 @@ def compute_total_loss(
     Compute the total InfoSkill loss (paper Eq. 8).
 
     Args:
+        alpha_fidelity: weight for fidelity_loss（消融实验中设为 0.0 即可
+                         去掉 fidelity 监督）。
+        alpha_rate:      weight for rate_loss（消融实验中设为 0.0 即可去掉
+                         rate/KL 监督）。默认值 0.0001 = 旧 alpha1 × beta
+                         (0.1 × 0.001)，与旧公式在不消融时数值等价。
         fidelity_mask: 独立于 mask 的 fidelity-only mask。零方差组（advantage 全 0）
                        用全 0 掩码跳过 fidelity 监督，避免 RewardPredictor 被教成
                        常数预测器；policy 项因 advantage=0 天然无梯度，rate 是
@@ -126,5 +137,5 @@ def compute_total_loss(
     r_loss = compute_rate_loss(mu, log_var, prior_mu, prior_log_var, mask)
     g_loss = grounding_loss   # already a scalar from GroundingDecoder
 
-    total = p_loss + alpha1 * (f_loss + beta * r_loss) + alpha2 * g_loss
+    total = p_loss + alpha_fidelity * f_loss + alpha_rate * r_loss + alpha2 * g_loss
     return total, p_loss, f_loss, r_loss, g_loss

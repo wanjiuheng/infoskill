@@ -47,9 +47,11 @@ fast:
   grounding_max_len: 64
 
 loss:
-  alpha1: 0.1
+  alpha_fidelity: 0.1
+  alpha_rate: 0.0001
   alpha2: 0.01
-  beta: 0.001
+
+decoder_type: "lstm"
 
 rollout:
   group_size: 4            # 与事故 run 一致 —— 怀疑 batch=4 是必要条件之一，不简化
