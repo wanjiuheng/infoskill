@@ -27,15 +27,13 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1          # weight for fidelity loss（消融实验设为 0.0 即可去掉）
-  alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta；消融实验设为
-                                # 0.0 即可去掉；单独系数便于 loss 消融实验独立开关）
-  alpha2: 0.01                 # weight for grounding loss
+  alpha_fidelity: 0.1           # weight for fidelity loss
+  alpha_rate: 0.0               # exp3: 消融 rate loss（同 exp1）
+  alpha2: 0.01                  # weight for grounding loss
 
 # ── Fast Module: GroundingDecoder 实现选择 ────────────────────────────────────
-# "lstm"（默认，与现有训练完全一致）| "transformer"（消融实验用，2层
-# decoder-only transformer，接口与 lstm 版完全一致，可直接互换）
-decoder_type: "lstm"
+# exp3: GroundingDecoder 从 LSTM 换成 2层 decoder-only transformer
+decoder_type: "transformer"
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:
