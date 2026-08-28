@@ -104,6 +104,19 @@ class T5StateConditionalEncoder(nn.Module):
     def _t5_encoder(self) -> nn.Module:
         return self._t5_encoder_holder[0]
 
+    def train(self, mode: bool = True) -> "T5StateConditionalEncoder":
+        """
+        覆写 train()：_t5_encoder 存在 list 里，不是注册的子模块，
+        nn.Module.train() 默认的 self.children() 递归遍历不到它，
+        shared_t5 内部的 dropout 层会一直停留在 training=True（即使
+        eval() 时也不会真正关闭）。手动同步一次，保证 encoder.eval()/
+        train() 对 shared_t5 生效（nn.Module.eval() 内部就是调
+        self.train(False)，所以只需覆写这一个方法）。
+        """
+        super().train(mode)
+        self._t5_encoder.train(mode)
+        return self
+
     def _encode_pool(self, texts: List[str], monitor: "TruncationMonitor") -> torch.Tensor:
         device = next(self._t5_encoder.parameters()).device
         monitor.record(self.tokenizer, texts, self.max_length)

@@ -100,6 +100,19 @@ class T5GroundingDecoder(nn.Module):
     def _lm_head(self) -> nn.Module:
         return self._lm_head_holder[0]
 
+    def train(self, mode: bool = True) -> "T5GroundingDecoder":
+        """
+        覆写 train()：_t5_decoder/_lm_head 存在 list 里，不是注册的子模块，
+        nn.Module.train() 默认的递归遍历不到它们（同 models/encoder_t5.py
+        的 T5StateConditionalEncoder.train() 注释）。目前项目里没有任何
+        地方调用 grounding_decoder.eval()/train()（grounding_decoder 只在
+        训练路径的 _compute_grounding_loss 里被调用），但覆写一下避免
+        以后有人加了 eval() 调用却踩到同一个坑。
+        """
+        super().train(mode)
+        self._t5_decoder.train(mode)
+        return self
+
     def _build_memory(self, z_tilde: torch.Tensor, pooled_state: torch.Tensor) -> torch.Tensor:
         feat = torch.cat([z_tilde, pooled_state], dim=-1)             # [B, latent+pooled]
         flat = self.fc_memory(feat)                                    # [B, NUM*d_model]

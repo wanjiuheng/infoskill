@@ -654,9 +654,13 @@ class InfoskillTrainer:
         #    一致，防止 rank 局部条件造成错位。warn 保留用于确认是否出现。
         if self.is_ddp:
             import torch.distributed as dist
+            # shared_t5 必须列进来：encoder/grounding_decoder 的 .parameters()
+            # 不包含它（见 models/encoder_t5.py 的下划线前缀说明），如果漏了，
+            # 每个 rank 的 shared_t5 梯度永远不会跨卡同步，从第一次 optimizer.step()
+            # 就开始分叉（同 aux 模块初始权重不同步的历史 bug 是同一类问题）。
             aux_modules = [
                 self.encoder, self.prior_net, self.projector,
-                self.reward_predictor, self.grounding_decoder,
+                self.reward_predictor, self.grounding_decoder, self.shared_t5,
             ]
             n_lora = 0
             for name, p in self.model.named_parameters():

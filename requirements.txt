@@ -15,6 +15,10 @@ pyyaml
 numpy
 tqdm
 matplotlib                      # loss/eval/steps 曲线绘图
+sentencepiece                   # exp4: T5TokenizerFast.from_pretrained("google/t5-efficient-tiny")
+                                 # 用 SentencePiece 词表；若仓库只有原始
+                                 # spiece.model（没有预转换好的 tokenizer.json），
+                                 # HF 会现场做 slow→fast 转换，需要这个包才能成功
 
 # ALFWorld environment (text mode: AlfredTWEnv)
 alfworld

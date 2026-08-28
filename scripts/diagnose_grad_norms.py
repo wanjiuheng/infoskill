@@ -135,9 +135,16 @@ def main():
         return
 
     # ── 模块组 ──────────────────────────────────────────────────────────────
+    # exp4: encoder/grounding_decoder 自己的 .parameters() 现在只是各自的小
+    # 投影头（fc_mu/fc_logvar、fc_memory），~15.6M 的 T5 权重（shared_t5）
+    # 不在这两者的 .parameters() 里（见 models/encoder_t5.py 的下划线前缀
+    # 说明）。单独列一个 "shared_t5" module group，否则 T5 的梯度完全不会
+    # 出现在下面的诊断输出里，"encoder+projector" 那一行看到的只是投影头
+    # 的梯度范数，会让人误判 encoder 侧几乎没梯度。
     ep_params = list(encoder.parameters()) + list(projector.parameters())
     module_groups = {
         "encoder+projector": ep_params,
+        "shared_t5":         list(shared_t5.parameters()),
         "reward_predictor":  list(reward_predictor.parameters()),
         "prior_net":         list(prior_net.parameters()),
         "grounding_decoder": list(grounding_decoder.parameters()),
