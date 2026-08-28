@@ -91,15 +91,27 @@ def main():
     model.eval()
 
     # ── Fast modules (only Encoder + Projector needed for eval) ──────────────
-    from models.encoder import StateConditionalEncoder
+    # exp4: Encoder 是热启动 T5，需要单独构造 shared_t5 并加载它自己的
+    # checkpoint 权重（不这样做的话 encoder 会用随机初始化的 T5，而不是
+    # 训练过的权重——T5 的 state_dict 与 encoder/grounding_decoder 分开存，
+    # 见 training/trainer.py 的 save_checkpoint）。
+    from transformers import T5ForConditionalGeneration, T5TokenizerFast
+    from models.encoder_t5 import T5StateConditionalEncoder
     from models.projector import Projector
 
-    state_dim  = cfg["model"]["hidden_size"]
     latent_dim = cfg["fast"]["latent_dim"]
     num_prefix = cfg["fast"]["num_prefix"]
+    state_dim  = cfg["model"]["hidden_size"]   # Qwen hidden size, for Projector
 
-    encoder   = StateConditionalEncoder(
-        state_dim=state_dim, skill_dim=state_dim, latent_dim=latent_dim
+    t5_name = cfg["fast"].get("t5_backbone", "google/t5-efficient-tiny")
+    shared_t5 = T5ForConditionalGeneration.from_pretrained(t5_name).to(device)
+    t5_tokenizer = T5TokenizerFast.from_pretrained(t5_name)
+    d_model = shared_t5.config.d_model
+
+    encoder   = T5StateConditionalEncoder(
+        t5_encoder=shared_t5.encoder, t5_tokenizer=t5_tokenizer,
+        d_model=d_model, latent_dim=latent_dim,
+        max_length=cfg["fast"].get("t5_max_length", 256),
     ).to(device)
     projector = Projector(
         latent_dim=latent_dim, num_prefix=num_prefix, llm_hidden_size=state_dim
@@ -110,6 +122,13 @@ def main():
     state = torch.load(aux_path, map_location=device)
     encoder.load_state_dict(state["encoder"])
     projector.load_state_dict(state["projector"])
+    if "shared_t5" in state:
+        shared_t5.load_state_dict(state["shared_t5"])
+    else:
+        logger.warning(
+            "No shared_t5 in checkpoint %s — encoder uses freshly-initialised "
+            "T5 weights.", args.checkpoint,
+        )
     encoder.eval()
     projector.eval()
 

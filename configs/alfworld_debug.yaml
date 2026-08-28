@@ -27,11 +27,13 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1          # weight for fidelity loss（消融实验设为 0.0 即可去掉）
+  alpha_fidelity: 0.1          # weight for fidelity loss
   alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta）
   alpha2: 0.01                 # weight for grounding loss
 
-decoder_type: "lstm"          # "lstm"（默认）| "transformer"（消融实验用）
+# exp4 固定用 T5GroundingDecoder，不consult decoder_type（见 train.py 的
+# build_fast_modules）；t5_backbone 沿用 configs/alfworld.yaml 的默认值
+# google/t5-efficient-tiny（未在此显式覆盖）。
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:

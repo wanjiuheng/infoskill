@@ -363,7 +363,9 @@ class SkillLibrary:
         encoder,
         prior_net,
         reward_predictor,
-        state_embs: torch.Tensor,    # [N, state_dim]  — recent usage history
+        state_texts: List[str],      # 原始文本 — recent usage history（exp4：
+                                       # 不再是预先算好的向量，见 trainer.py
+                                       # 的 _resolve_usage_history）
         advantages: torch.Tensor,    # [N]  — corresponding GRPO advantages
         beta: float = 0.001,
     ) -> float:
@@ -376,10 +378,11 @@ class SkillLibrary:
 
         Args:
             skill:           The skill being evaluated.
-            encoder:         StateConditionalEncoder instance (eval mode).
-            prior_net:       PriorNetwork instance (eval mode).
-            reward_predictor: RewardPredictor instance (eval mode).
-            state_embs:      Recent state embeddings from steps where skill was used.
+            encoder:         T5StateConditionalEncoder instance (eval mode)。
+                             吃原始文本，内部返回 (mu, log_var, pooled_state)。
+            prior_net:       PriorNetwork instance (eval mode)，输入 pooled_state。
+            reward_predictor: RewardPredictor instance (eval mode)，输入 pooled_state。
+            state_texts:      Recent state texts from steps where skill was used.
             advantages:      Corresponding GRPO advantages.
             beta:            Compression weight (same as training beta).
 
@@ -390,25 +393,19 @@ class SkillLibrary:
         from models.encoder import sample_z
         from training.losses import compute_rate_loss
 
-        if len(state_embs) == 0:
+        if len(state_texts) == 0:
             return 0.0
 
-        # Embed the skill text
-        skill_emb = get_text_embedding(
-            skill.grounding_text, self._model, self._tokenizer, self._device
-        )  # [hidden]
-        if skill_emb.dim() == 1:
-            skill_emb = skill_emb.unsqueeze(0).expand(len(state_embs), -1)
-
-        mu, log_var = encoder(state_embs, skill_emb)
+        skill_texts = [skill.grounding_text] * len(state_texts)
+        mu, log_var, pooled_state = encoder(state_texts, skill_texts)
         z_tilde = sample_z(mu, log_var)
 
         # Fidelity: how well z predicts the advantage
-        pred_adv = reward_predictor(z_tilde, state_embs)
+        pred_adv = reward_predictor(z_tilde, pooled_state)
         fidelity = -F.mse_loss(pred_adv, advantages).item()
 
         # Rate: KL divergence vs prior
-        prior_mu, prior_logvar = prior_net(state_embs)
+        prior_mu, prior_logvar = prior_net(pooled_state)
         rate = compute_rate_loss(mu, log_var, prior_mu, prior_logvar).item()
 
         return fidelity - beta * rate
@@ -418,7 +415,7 @@ class SkillLibrary:
         encoder,
         prior_net,
         reward_predictor,
-        usage_history: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+        usage_history: Dict[str, Tuple[List[str], torch.Tensor]],
         beta: float = 0.001,
         min_uses: int = 5,
     ) -> List[str]:
@@ -429,7 +426,10 @@ class SkillLibrary:
         保留），避免训练早期模型未收敛时误删 seed 技能。
 
         Args:
-            usage_history: Dict mapping skill_id → (state_embs, advantages).
+            usage_history: Dict mapping skill_id → (state_texts, advantages)
+                           （exp4：state_texts 是原始文本列表，不再是预先
+                           算好的向量，见 training/trainer.py 的
+                           _resolve_usage_history）。
             min_uses:      Skip skills that haven't been used enough to estimate.
 
         Returns:
@@ -445,13 +445,13 @@ class SkillLibrary:
             if entries is None:
                 scored.append((float("inf"), idx, skill))
                 continue
-            state_embs, advs = entries
-            if len(state_embs) < min_uses:
+            state_texts, advs = entries
+            if len(state_texts) < min_uses:
                 scored.append((float("inf"), idx, skill))
                 continue
             mig = self.evaluate_mig(
                 skill, encoder, prior_net, reward_predictor,
-                state_embs, advs, beta=beta,
+                state_texts, advs, beta=beta,
             )
             scored.append((mig, idx, skill))
 

@@ -234,61 +234,62 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
 def build_fast_modules(cfg: dict, device: torch.device):
     """Instantiate Encoder, PriorNet, Projector, RewardPredictor, GroundingDecoder.
 
-    cfg["decoder_type"]（默认 "lstm"）选择 GroundingDecoder 的具体实现：
-    "lstm"（现有实现）或 "transformer"（消融实验用，2层 decoder-only
-    transformer，接口与 lstm 版完全一致，调用方无需区分）。
+    exp4（模块消融）：Encoder/GroundingDecoder 换成热启动的
+    google/t5-efficient-tiny（共享同一个 T5 实例，见下方 shared_t5 —— 与
+    T5 预训练时的 embedding weight tying 保持一致，也避免这份权重被优化器
+    重复注册，见 build_optimizer）。PriorNetwork/RewardPredictor 不需要新
+    实现，只是构造时的 state_dim 从旧的 Qwen hidden_size(3584) 换成 T5 的
+    d_model(256) —— 它们现在吃的是 T5StateConditionalEncoder 返回的
+    pooled_state，不是旧的 Qwen mean-pool 向量。
+
+    返回值新增第 6 项 shared_t5（其他分支返回 5 项）：调用方需要它做
+    optimizer 的单独 param group 注册（不能通过 encoder/grounding_decoder
+    的 .parameters() 重复收集，见 build_optimizer）以及 checkpoint 的独立
+    save/load（training/trainer.py 的 save_checkpoint/load_checkpoint）。
     """
-    from models.encoder import StateConditionalEncoder, PriorNetwork
+    from transformers import T5ForConditionalGeneration, T5TokenizerFast
+    from models.encoder import PriorNetwork
+    from models.encoder_t5 import T5StateConditionalEncoder
+    from models.grounding_decoder_t5 import T5GroundingDecoder
     from models.projector import Projector
     from models.reward_predictor import RewardPredictor
-    from transformers import AutoTokenizer
 
-    decoder_type = cfg.get("decoder_type", "lstm")
-    if decoder_type == "lstm":
-        from models.grounding_decoder import GroundingDecoder
-    elif decoder_type == "transformer":
-        from models.grounding_decoder_transformer import (
-            GroundingDecoder as GroundingDecoder,
-        )
-    else:
-        raise ValueError(
-            f"Unknown decoder_type={decoder_type!r}, expected 'lstm' or 'transformer'."
-        )
-
-    state_dim  = cfg["model"]["hidden_size"]   # 3584
-    skill_dim  = state_dim
     latent_dim = cfg["fast"]["latent_dim"]     # 64
     num_prefix = cfg["fast"]["num_prefix"]     # 8
-    hidden_sz  = cfg["model"]["hidden_size"]   # 3584
+    hidden_sz  = cfg["model"]["hidden_size"]   # 3584 (Qwen, for Projector output)
 
-    # Vocab size from tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg["model"]["backbone"], trust_remote_code=True
-    )
-    vocab_size = len(tokenizer)
+    t5_name = cfg["fast"].get("t5_backbone", "google/t5-efficient-tiny")
+    shared_t5 = T5ForConditionalGeneration.from_pretrained(t5_name).to(device)
+    t5_tokenizer = T5TokenizerFast.from_pretrained(t5_name)
+    d_model = shared_t5.config.d_model   # 256 for t5-efficient-tiny
 
-    encoder = StateConditionalEncoder(
-        state_dim=state_dim, skill_dim=skill_dim, latent_dim=latent_dim
+    encoder = T5StateConditionalEncoder(
+        t5_encoder=shared_t5.encoder,
+        t5_tokenizer=t5_tokenizer,
+        d_model=d_model,
+        latent_dim=latent_dim,
+        max_length=cfg["fast"].get("t5_max_length", 256),
     ).to(device)
     prior_net = PriorNetwork(
-        state_dim=state_dim, latent_dim=latent_dim
+        state_dim=d_model, latent_dim=latent_dim
     ).to(device)
     projector = Projector(
         latent_dim=latent_dim, num_prefix=num_prefix, llm_hidden_size=hidden_sz
     ).to(device)
     reward_predictor = RewardPredictor(
-        latent_dim=latent_dim, state_dim=state_dim
+        latent_dim=latent_dim, state_dim=d_model
     ).to(device)
-    grounding_decoder = GroundingDecoder(
+    grounding_decoder = T5GroundingDecoder(
+        t5_decoder=shared_t5.decoder,
+        lm_head=shared_t5.lm_head,
+        t5_tokenizer=t5_tokenizer,
+        d_model=d_model,
         latent_dim=latent_dim,
-        state_dim=state_dim,
-        vocab_size=vocab_size,
-        hidden_dim=cfg["fast"]["grounding_hidden_dim"],
+        pooled_state_dim=d_model,
         max_len=cfg["fast"]["grounding_max_len"],
-        pad_token_id=tokenizer.pad_token_id or 0,
     ).to(device)
 
-    return encoder, prior_net, projector, reward_predictor, grounding_decoder
+    return encoder, prior_net, projector, reward_predictor, grounding_decoder, shared_t5
 
 
 # ── Env factories ─────────────────────────────────────────────────────────────
@@ -341,8 +342,18 @@ def make_eval_env_factory(cfg: dict):
 
 # ── Optimiser ─────────────────────────────────────────────────────────────────
 
-def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
-    """Single AdamW over LoRA params + all auxiliary modules."""
+def build_optimizer(model, modules: list, cfg: dict, shared_t5=None) -> torch.optim.Optimizer:
+    """Single AdamW over LoRA params + all auxiliary modules.
+
+    shared_t5: exp4 only. T5StateConditionalEncoder/T5GroundingDecoder hold
+    `shared_t5.encoder`/`shared_t5.decoder`/`shared_t5.lm_head` via
+    underscore-prefixed attributes (not registered as PyTorch submodules —
+    see models/encoder_t5.py), so `.parameters()` on those wrapper modules
+    does NOT include shared_t5's weights. Add them here as a separate,
+    single param group so the shared embedding/decoder/lm_head weights are
+    registered in the optimizer exactly once (not duplicated across the two
+    wrapper modules, and not silently dropped).
+    """
     params = []
     # LoRA params
     for p in model.parameters():
@@ -353,7 +364,10 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
         params.extend(m.parameters())
 
     lr = float(cfg["training"].get("learning_rate", 1e-4))
-    return torch.optim.AdamW(params, lr=lr)
+    optimizer = torch.optim.AdamW(params, lr=lr)
+    if shared_t5 is not None:
+        optimizer.add_param_group({"params": list(shared_t5.parameters()), "lr": lr})
+    return optimizer
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -424,21 +438,24 @@ def main():
     model, tokenizer = build_model_and_tokenizer(cfg, device, is_ddp)
 
     # Build fast modules
-    encoder, prior_net, projector, reward_predictor, grounding_decoder = build_fast_modules(cfg, device)
+    encoder, prior_net, projector, reward_predictor, grounding_decoder, shared_t5 = \
+        build_fast_modules(cfg, device)
 
     # DDP: 初始权重从 rank0 广播（不包 DDP 后没有构造期广播）。set_seed(seed+rank)
     # 按 rank 播种 → LoRA 与 aux 模块每 rank 随机初始化不同；不同步则各 rank 从
     # 不同起点训练，即使梯度 allreduce 后也永久保持初始偏移分叉。之前只有 LoRA
     # 被 DDP 构造器广播，aux 模块从未同步（潜在分叉 bug），这里一并修复。
+    # shared_t5 单独广播一次（encoder/grounding_decoder 的 .parameters() 不包含
+    # 它，见 models/encoder_t5.py 的说明）。
     if is_ddp:
         for p in model.parameters():
             if p.requires_grad:
                 dist.broadcast(p.data, src=0)
-        for m in (encoder, prior_net, projector, reward_predictor, grounding_decoder):
+        for m in (encoder, prior_net, projector, reward_predictor, grounding_decoder, shared_t5):
             for p in m.parameters():
                 if p.requires_grad:
                     dist.broadcast(p.data, src=0)
-        logger.info("Broadcast initial trainable weights from rank 0 (LoRA + aux)")
+        logger.info("Broadcast initial trainable weights from rank 0 (LoRA + aux + shared_t5)")
 
     # Build skill library - need to pass the base model (unwrapped)
     from skill_library.library import SkillLibrary
@@ -456,9 +473,9 @@ def main():
     from skill_library.skill_updater import SkillUpdater
     skill_updater = SkillUpdater(model=base_model, tokenizer=tokenizer, device=device)
 
-    # Build optimiser
+    # Build optimiser（shared_t5 单独一个 param group，见 build_optimizer 说明）
     aux_modules = [encoder, prior_net, projector, reward_predictor, grounding_decoder]
-    optimizer   = build_optimizer(model, aux_modules, cfg)
+    optimizer   = build_optimizer(model, aux_modules, cfg, shared_t5=shared_t5)
 
     # Build trainer
     from training.trainer import InfoskillTrainer
@@ -470,6 +487,7 @@ def main():
         projector=projector,
         reward_predictor=reward_predictor,
         grounding_decoder=grounding_decoder,
+        shared_t5=shared_t5,
         skill_lib=skill_lib,
         skill_updater=skill_updater,
         optimizer=optimizer,

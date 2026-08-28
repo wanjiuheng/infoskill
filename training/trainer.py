@@ -37,13 +37,13 @@ from training.rollout import GroupRolloutCollector, TrajectoryBuffer, StepRecord
 from training.grpo import compute_grpo_advantages_grouped
 from training.losses import compute_total_loss
 from envs.alfworld_env import AlfworldTextEnv
-from models.encoder import StateConditionalEncoder, PriorNetwork
+from models.encoder import PriorNetwork
+from models.encoder_t5 import T5StateConditionalEncoder
+from models.grounding_decoder_t5 import T5GroundingDecoder
 from models.projector import Projector
 from models.reward_predictor import RewardPredictor
-from models.grounding_decoder import GroundingDecoder
 from skill_library.library import SkillLibrary
 from skill_library.skill_updater import SkillUpdater
-from utils.embedding import get_text_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +55,19 @@ class InfoskillTrainer:
     Args:
         model:        Qwen2.5-7B-Instruct with LoRA applied (main policy / BRAIN).
         tokenizer:    Matching tokenizer.
-        encoder:      StateConditionalEncoder.
-        prior_net:    PriorNetwork.
+        encoder:      T5StateConditionalEncoder (exp4: T5 热启动版).
+        prior_net:    PriorNetwork (state_dim=T5 d_model).
         projector:    Projector.
-        reward_predictor: RewardPredictor.
-        grounding_decoder: GroundingDecoder.
+        reward_predictor: RewardPredictor (state_dim=T5 d_model).
+        grounding_decoder: T5GroundingDecoder (exp4: T5 热启动版).
+        shared_t5:    底层共享的 T5ForConditionalGeneration 实例（encoder/
+                      grounding_decoder 只持有其 encoder/decoder/lm_head 子
+                      模块的引用，不注册为自己的子模块，见 models/encoder_t5.py）。
+                      单独持有以便 checkpoint 的独立 save/load（optimizer 的
+                      注册已在 train.py 的 build_optimizer 里单独处理）。
         skill_lib:    SkillLibrary.
         skill_updater: SkillUpdater.
-        optimizer:    Single AdamW covering all trainable params.
+        optimizer:    Single AdamW covering all trainable params (incl. shared_t5).
         device:       Compute device.
         cfg:          Full config dict (loaded from alfworld.yaml).
     """
@@ -71,11 +76,12 @@ class InfoskillTrainer:
         self,
         model,
         tokenizer,
-        encoder:            StateConditionalEncoder,
+        encoder:            T5StateConditionalEncoder,
         prior_net:          PriorNetwork,
         projector:          Projector,
         reward_predictor:   RewardPredictor,
-        grounding_decoder:  GroundingDecoder,
+        grounding_decoder:  T5GroundingDecoder,
+        shared_t5,
         skill_lib:          SkillLibrary,
         skill_updater:      SkillUpdater,
         optimizer:          torch.optim.Optimizer,
@@ -97,6 +103,7 @@ class InfoskillTrainer:
         self.projector         = projector
         self.reward_predictor  = reward_predictor
         self.grounding_decoder = grounding_decoder
+        self.shared_t5         = shared_t5
         self.skill_lib         = skill_lib
         self.skill_updater     = skill_updater
         self.optimizer         = optimizer
@@ -556,14 +563,16 @@ class InfoskillTrainer:
             B = len(batch_records)
 
             # ── 4a. 重新计算 encoder forward（带梯度）──────────────────────────
-            state_embs_b = torch.stack(
-                [r.state_emb for r in batch_records], dim=0
-            ).to(self.device)  # [B, D]
-            skill_embs_b = torch.stack(
-                [r.skill_emb for r in batch_records], dim=0
-            ).to(self.device)  # [B, D]
+            #    exp4: encoder 直接吃存储的原始文本（state_text/skill_text），
+            #    内部用 T5 tokenizer 编码 + T5 encoder 前向；额外返回
+            #    pooled_state（T5 d_model 维），取代旧的 Qwen state_emb，供
+            #    prior_net/reward_predictor/grounding_decoder 统一使用。
+            state_texts_b = [r.state_text for r in batch_records]
+            skill_texts_b = [r.skill_text for r in batch_records]
 
-            mu_new, log_var_new = self.encoder(state_embs_b, skill_embs_b)  # [B, L]
+            mu_new, log_var_new, pooled_state_b = self.encoder(
+                state_texts_b, skill_texts_b
+            )  # mu/log_var: [B, L], pooled_state_b: [B, D_t5]
 
             # ── 4b. 用存储的 eps 重构 z_tilde（带梯度）────────────────────────
             eps_b = torch.stack(
@@ -582,9 +591,10 @@ class InfoskillTrainer:
                 batch_records, soft_prefix_b
             )  # [B]
 
-            # ── 4e. 计算 prior、reward predictor ─────────────────────────────
-            prior_mu_b, prior_logvar_b = self.prior_net(state_embs_b)  # [B, L]
-            pred_advantage_b = self.reward_predictor(z_tilde_new, state_embs_b)  # [B]
+            # ── 4e. 计算 prior、reward predictor（用 pooled_state，不再是旧的
+            #    Qwen state_emb——保证 posterior/prior 的"state"概念一致）──
+            prior_mu_b, prior_logvar_b = self.prior_net(pooled_state_b)  # [B, L]
+            pred_advantage_b = self.reward_predictor(z_tilde_new, pooled_state_b)  # [B]
 
             # ── 4f. Grounding loss（这个 mini-batch）─────────────────────────
             # 用本 batch 的 encoder 重算 z（带梯度），grounding 梯度能回传
@@ -683,10 +693,13 @@ class InfoskillTrainer:
         self.optimizer.step()
 
         # 7. 更新 usage history（用于 Slow Module MIG 计算）
+        #    exp4: 存 state_text（原始文本）而不是 state_emb 向量——
+        #    evaluate_mig（skill_library/library.py）需要 pooled_state 时
+        #    会现场用 encoder 重新编码这批文本（与 _fast_update 的 4a 一致）。
         with torch.no_grad():
             for rec, adv in zip(active_records, adv_list):
                 self._usage_history[rec.skill_text[:50]].append(
-                    (rec.state_emb.cpu(), float(adv))
+                    (rec.state_text, float(adv))
                 )
 
         # 8. 返回平均 loss（用于日志）
@@ -705,29 +718,26 @@ class InfoskillTrainer:
         gradient flows back into the encoder (grounding anchors z to the skill
         text). The rollout-stored z_tilde is detached and would only train the
         GroundingDecoder.
+
+        exp4: encoder 直接吃存储的 state_text/skill_text 原始文本；
+        T5GroundingDecoder 全程用 T5 自己的 tokenizer/vocab（target_texts
+        参数内部 tokenize，不再用 Qwen tokenizer 编码 target_ids —— 保持
+        embedding/decoder/输出头与 T5 预训练时的原生对齐关系）。
         """
         # 随机抽 ≤16 条，避免"总取前几条"的偏置；cap 控显存
         sample = random.sample(records, min(16, len(records)))
 
-        s_batch = torch.stack([r.state_emb for r in sample], dim=0).to(self.device)
-        k_batch = torch.stack([r.skill_emb for r in sample], dim=0).to(self.device)
+        state_texts = [r.state_text for r in sample]
+        skill_texts = [r.skill_text for r in sample]
         eps_batch = torch.stack([r.eps for r in sample], dim=0).to(self.device)
 
-        mu_s, log_var_s = self.encoder(s_batch, k_batch)
+        mu_s, log_var_s, pooled_state_s = self.encoder(state_texts, skill_texts)
         std_s = torch.exp(0.5 * log_var_s)
         z_tilde_s = mu_s + std_s * eps_batch   # [B, latent_dim], 梯度 → encoder
 
-        # Tokenise grounding targets (skill texts)
-        skill_texts = [r.skill_text for r in sample]
-        enc = self.tokenizer(
-            skill_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.get("fast", {}).get("grounding_max_len", 64),
-        ).to(self.device)
-
-        return self.grounding_decoder(z_tilde_s, s_batch, target_ids=enc.input_ids)
+        return self.grounding_decoder(
+            z_tilde_s, pooled_state_s, target_texts=skill_texts
+        )
 
     def _recompute_log_probs_batch(
         self,
@@ -906,16 +916,17 @@ class InfoskillTrainer:
 
     def _resolve_usage_history(
         self,
-    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Dict[str, Tuple[List[str], torch.Tensor]]:
         """
         Convert the deque-based usage_history (keyed by skill text prefix)
-        into a dict keyed by skill_id, with stacked tensors.
+        into a dict keyed by skill_id.
 
-        state_emb 设备统一：_fast_update 写入时固定 .cpu()，但 load_checkpoint
-        用 map_location=self.device 恢复 checkpoint 时会把里面保存的 cpu tensor
-        搬到 cuda:0——resume 后旧 entries 在 cuda、新 entries 在 cpu，直接
-        torch.stack 会报设备不一致（Expected all tensors to be on the same
-        device, cuda:0 and cpu）。这里先逐个 .cpu() 归一化再 stack。
+        exp4: usage_history 存 (state_text, advantage)（原始文本，见
+        _fast_update 第 7 步）。这里只做按 skill_id 重新分组，不在此处调用
+        encoder——encoding 留给 evaluate_mig（skill_library/library.py）
+        去做，那里已经知道对应的 skill_text，一次性把 (state_texts,
+        skill_texts) 一起喂给 encoder，与 _fast_update/_compute_grounding_loss
+        走的是同一条"传文本给 encoder"路径，不重复编码逻辑。
         """
         result = {}
         for skill in self.skill_lib:
@@ -925,18 +936,26 @@ class InfoskillTrainer:
             entries = list(self._usage_history[key])
             if not entries:
                 continue
-            state_embs = torch.stack([e[0].cpu() for e in entries]).to(self.device)
-            advantages = torch.tensor([e[1] for e in entries], device=self.device)
-            result[skill.skill_id] = (state_embs, advantages)
+            state_texts = [e[0] for e in entries]
+            advantages = torch.tensor(
+                [e[1] for e in entries], device=self.device
+            )
+            result[skill.skill_id] = (state_texts, advantages)
         return result
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
     def _all_params(self):
-        """Generator over all trainable parameters (LoRA + auxiliary modules)."""
+        """Generator over all trainable parameters (LoRA + auxiliary modules).
+
+        exp4: encoder/grounding_decoder 的 .parameters() 不包含 shared_t5
+        的权重（见 models/encoder_t5.py 的下划线前缀说明），所以这里显式
+        把 shared_t5 也列进来，否则梯度裁剪（clip_grad_norm_）会漏掉它的
+        梯度，裁剪范数计算不完整。
+        """
         modules = [
             self.model, self.encoder, self.prior_net, self.projector,
-            self.reward_predictor, self.grounding_decoder,
+            self.reward_predictor, self.grounding_decoder, self.shared_t5,
         ]
         for m in modules:
             for p in m.parameters():
@@ -956,12 +975,16 @@ class InfoskillTrainer:
         model_to_save.save_pretrained(os.path.join(path, "lora"))
 
         # Save auxiliary modules
+        # exp4: shared_t5 单独存一份（决策：宁可磁盘冗余，也不在 state_dict()
+        # 里做特殊 override——encoder/grounding_decoder 的 .parameters() 不
+        # 包含它，若不单独存会静默丢失 T5 的训练进度）。
         torch.save({
             "encoder":           self.encoder.state_dict(),
             "prior_net":         self.prior_net.state_dict(),
             "projector":         self.projector.state_dict(),
             "reward_predictor":  self.reward_predictor.state_dict(),
             "grounding_decoder": self.grounding_decoder.state_dict(),
+            "shared_t5":         self.shared_t5.state_dict(),
             "optimizer":         self.optimizer.state_dict(),
             "episode_count":     self._episode_count,
             "global_step":       self._global_step,
@@ -1003,6 +1026,14 @@ class InfoskillTrainer:
         self.projector.load_state_dict(state["projector"])
         self.reward_predictor.load_state_dict(state["reward_predictor"])
         self.grounding_decoder.load_state_dict(state["grounding_decoder"])
+        if "shared_t5" in state:
+            self.shared_t5.load_state_dict(state["shared_t5"])
+        else:
+            logger.warning(
+                "No shared_t5 in checkpoint %s — keeping freshly-initialised "
+                "T5 weights (this checkpoint predates exp4's shared_t5, or "
+                "was saved incorrectly).", path,
+            )
         self.optimizer.load_state_dict(state["optimizer"])
         self._episode_count = state["episode_count"]
         self._global_step   = state["global_step"]

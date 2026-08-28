@@ -30,7 +30,6 @@ from typing import List, Dict, Optional, Tuple, Any
 
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
-from utils.embedding import get_text_embedding
 from utils.stopping_criteria import build_action_stop_criteria
 
 logger = logging.getLogger("rollout")
@@ -64,10 +63,12 @@ class StepRecord:
     """
     ep_idx:      int           # which episode (0..G-1)
     step_idx:    int           # step number within that episode
-    state_text:  str
-    skill_text:  str
-    state_emb:   torch.Tensor  # [state_dim], detached
-    skill_emb:   torch.Tensor  # [skill_dim], detached
+    state_text:  str           # "Task: {task_description}\nObservation: {obs}"
+                                # — fed to the T5 encoder directly (exp4:
+                                # no pre-pooled Qwen embedding any more；
+                                # _fast_update recomputes mu/log_var/pooled_state
+                                # fresh from this text each update).
+    skill_text:  str           # skill.grounding_text, also fed to T5 encoder directly
     mu:          torch.Tensor  # [latent_dim], detached
     log_var:     torch.Tensor  # [latent_dim], detached
     z_tilde:     torch.Tensor  # [latent_dim], detached — the actual sampled latent used for generation
@@ -163,10 +164,8 @@ class GroupRolloutCollector:
         self.temperature     = cfg.get("temperature", 0.9)
         self.top_p           = cfg.get("top_p", 0.9)
         self.history_len     = cfg.get("history_len", 3)
-
-        # Skill embedding cache: grounding_text → [D]. Skill is task-level, so
-        # the same skill text is re-embedded every step; cache avoids that.
-        self._skill_emb_cache: Dict[str, torch.Tensor] = {}
+        # exp4: 不再需要 skill embedding 缓存——encoder 直接吃 skill_text
+        # 原始文本，不预先算向量（旧 _skill_emb_cache 删除）。
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -237,20 +236,22 @@ class GroupRolloutCollector:
                     break
 
                 # 1. Retrieve skill (only for active episodes)
-                skill_texts_active, skill_embs_active = self._batch_retrieve_skills_active(
+                skill_texts_active = self._batch_retrieve_skills_active(
                     obs_list, info_list, active_indices
                 )
 
-                # 2. Embed states (only for active episodes)
-                state_embs_active = self._batch_embed_states_active(
-                    obs_list, active_indices
-                )  # [len(active_indices), D]
+                # 2. Build state_text (task + current obs) for active episodes
+                #    — exp4: encoder 直接吃原始文本（T5 tokenizer 内部编码），
+                #    不再预先用 Qwen mean-pool 出向量（旧 _batch_embed_states_active
+                #    已删除，见 models/encoder_t5.py 的方案A格式）。
+                state_texts_active = self._batch_build_state_texts_active(
+                    obs_list, info_list, active_indices
+                )
 
                 # 3. Encode → z_tilde (only for active episodes)
-                skill_emb_t_active = torch.stack(skill_embs_active, dim=0)  # [n_active, D]
-                mu_active, log_var_active = self.encoder(
-                    state_embs_active, skill_emb_t_active
-                )  # [n_active, L]
+                mu_active, log_var_active, pooled_state_active = self.encoder(
+                    state_texts_active, skill_texts_active
+                )  # mu/log_var: [n_active, L], pooled_state: [n_active, D_t5]
                 std_active = torch.exp(0.5 * log_var_active)
                 eps_active = torch.randn_like(std_active)
                 z_tilde_active = mu_active + std_active * eps_active  # [n_active, L]
@@ -265,25 +266,28 @@ class GroupRolloutCollector:
                 )
 
                 # Map active results back to full G indices
+                # exp4: state_text/skill_text 是 str，直接用列表存（不再是 Tensor），
+                # pooled_state 不需要跨 no_grad 边界保留——它只在本 step 内部用于
+                # GroundingDecoder 的 grounding loss（若在 rollout 阶段计算的话），
+                # 但目前 grounding loss 只在 _fast_update 里按存储的 state_text
+                # 重新过 encoder 计算，rollout 阶段不需要保留 pooled_state。
                 skill_texts_full = [""] * self.G
-                skill_embs_full = [torch.zeros_like(skill_embs_active[0])] * self.G
+                state_texts_full = [""] * self.G
                 mu_full = torch.zeros(self.G, mu_active.size(1), device=mu_active.device)
                 log_var_full = torch.zeros(self.G, log_var_active.size(1), device=log_var_active.device)
                 z_tilde_full = torch.zeros(self.G, z_tilde_active.size(1), device=z_tilde_active.device)
                 eps_full = torch.zeros(self.G, eps_active.size(1), device=eps_active.device)
-                state_embs_full = torch.zeros(self.G, state_embs_active.size(1), device=state_embs_active.device)
                 actions_raw_full = [""] * self.G
                 prompt_ids_full = [torch.tensor([]) for _ in range(self.G)]
                 gen_ids_full = [torch.tensor([]) for _ in range(self.G)]
 
                 for idx, i in enumerate(active_indices):
                     skill_texts_full[i] = skill_texts_active[idx]
-                    skill_embs_full[i] = skill_embs_active[idx]
+                    state_texts_full[i] = state_texts_active[idx]
                     mu_full[i] = mu_active[idx]
                     log_var_full[i] = log_var_active[idx]
                     z_tilde_full[i] = z_tilde_active[idx]
                     eps_full[i] = eps_active[idx]
-                    state_embs_full[i] = state_embs_active[idx]
                     actions_raw_full[i] = actions_raw_active[idx]
                     prompt_ids_full[i] = prompt_ids_active[idx]
                     gen_ids_full[i] = gen_ids_active[idx]
@@ -304,9 +308,7 @@ class GroupRolloutCollector:
                         # Still create a placeholder record to keep tensor shapes aligned
                         buf.records.append(StepRecord(
                             ep_idx=i, step_idx=step_idx,
-                            state_text=obs_list[i], skill_text=skill_texts_full[i],
-                            state_emb=state_embs_full[i].detach(),
-                            skill_emb=skill_embs_full[i].detach(),
+                            state_text=state_texts_full[i], skill_text=skill_texts_full[i],
                             mu=mu_full[i].detach(), log_var=log_var_full[i].detach(),
                             z_tilde=z_tilde_full[i].detach(), eps=eps_full[i].detach(),
                             prompt_ids=prompt_ids_full[i], gen_ids=gen_ids_full[i],
@@ -342,9 +344,7 @@ class GroupRolloutCollector:
 
                     buf.records.append(StepRecord(
                         ep_idx=i, step_idx=step_idx,
-                        state_text=obs_list[i], skill_text=skill_texts_full[i],
-                        state_emb=state_embs_full[i].detach(),
-                        skill_emb=skill_embs_full[i].detach(),
+                        state_text=state_texts_full[i], skill_text=skill_texts_full[i],
                         mu=mu_full[i].detach(), log_var=log_var_full[i].detach(),
                         z_tilde=z_tilde_full[i].detach(), eps=eps_full[i].detach(),
                         prompt_ids=prompt_ids_full[i], gen_ids=gen_ids_full[i],
@@ -399,42 +399,40 @@ class GroupRolloutCollector:
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
-    def _batch_embed_states_active(
+    def _batch_build_state_texts_active(
         self,
         obs_list:       List[str],
+        info_list:      List[Dict],
         active_indices: List[int],
-    ) -> torch.Tensor:
-        """Embed only active observations."""
-        active_obs = [obs_list[i] for i in active_indices]
-        return get_text_embedding(
-            active_obs, self.model, self.tokenizer, self.device
-        )  # [n_active, hidden]
+    ) -> List[str]:
+        """
+        构造 encoder 侧的 state_text（exp4 方案A：直接拼 task_description + obs
+        原始文本一次性交给 T5 tokenizer，不做结构化分段）。不再预先用 Qwen
+        mean-pool 出向量——encoder（T5StateConditionalEncoder）内部自己
+        tokenize + forward。
+        """
+        return [
+            f"Task: {info_list[i]['task_description']}\nObservation: {obs_list[i]}"
+            for i in active_indices
+        ]
 
     def _batch_retrieve_skills_active(
         self,
         obs_list:       List[str],
         info_list:      List[Dict],
         active_indices: List[int],
-    ) -> Tuple[List[str], List[torch.Tensor]]:
-        """Retrieve skills only for active episodes."""
+    ) -> List[str]:
+        """Retrieve skills only for active episodes. Returns skill_texts only —
+        exp4 的 encoder 直接吃 skill_text 原始文本，不需要预先算 embedding
+        （旧的 _skill_emb_cache 相应删除，见 __init__）。"""
         skill_texts = []
-        skill_embs  = []
         for i in active_indices:
             skill = self.skill_lib.retrieve_for_encoder(
                 info_list[i]["task_description"],
                 task_type=info_list[i].get("task_type"),
             )
             skill_texts.append(skill.grounding_text)
-            emb = self._skill_emb_cache.get(skill.grounding_text)
-            if emb is None:
-                emb = get_text_embedding(
-                    skill.grounding_text, self.model, self.tokenizer, self.device
-                )
-                if emb.dim() == 2:
-                    emb = emb.squeeze(0)
-                self._skill_emb_cache[skill.grounding_text] = emb
-            skill_embs.append(emb)
-        return skill_texts, skill_embs
+        return skill_texts
 
     def _build_prompt(
         self,

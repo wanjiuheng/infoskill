@@ -18,7 +18,6 @@ from tqdm import tqdm
 
 from envs.alfworld_env import AlfworldTextEnv
 from utils.action_parser import parse_action, match_admissible
-from utils.embedding import get_text_embedding
 from utils.stopping_criteria import build_action_stop_criteria
 from models.encoder import sample_z
 
@@ -122,9 +121,8 @@ def run_eval(
 
     results: Dict[str, List[bool]] = defaultdict(list)
     eval_start = time.time()
-
-    # Skill is task-level → same grounding_text re-embedded every step; cache it
-    skill_emb_cache: Dict[str, torch.Tensor] = {}
+    # exp4: encoder 直接吃原始文本，不再需要预先算 embedding 的缓存
+    # （旧 skill_emb_cache 删除）。
 
     # Reuse one env across episodes: AlfworldTextEnv.reseed switches the task
     # in-memory, avoiding re-initialising ALFWorld (re-scanning game dirs)
@@ -208,21 +206,12 @@ def run_eval(
                     info["task_description"], task_type=info["task_type"]
                 )
 
-                # Embed
-                state_emb = get_text_embedding(obs, model, tokenizer, device)  # [D]
-                if state_emb.dim() == 1:
-                    state_emb = state_emb.unsqueeze(0)                          # [1, D]
-                skill_emb = skill_emb_cache.get(skill.grounding_text)
-                if skill_emb is None:
-                    skill_emb = get_text_embedding(
-                        skill.grounding_text, model, tokenizer, device
-                    )
-                    if skill_emb.dim() == 1:
-                        skill_emb = skill_emb.unsqueeze(0)
-                    skill_emb_cache[skill.grounding_text] = skill_emb
+                # exp4: encoder 直接吃原始文本（与 training/rollout.py 的
+                # state_text 格式一致），不再预先用 Qwen mean-pool 出向量。
+                state_text = f"Task: {info['task_description']}\nObservation: {obs}"
 
                 # Encode → soft prefix
-                mu, log_var = encoder(state_emb, skill_emb)
+                mu, log_var, _pooled_state = encoder([state_text], [skill.grounding_text])
                 z_tilde     = sample_z(mu, log_var)             # [1, L]
                 soft_prefix = projector(z_tilde)                # [1, m, H]
 
@@ -502,7 +491,8 @@ def _run_eval_batched(
 
     results: Dict[str, List[bool]] = defaultdict(list)
     eval_start = time.time()
-    skill_emb_cache: Dict[str, torch.Tensor] = {}
+    # exp4: encoder 直接吃原始文本，不再需要预先算 embedding 的缓存
+    # （旧 skill_emb_cache 删除，与串行路径一致）。
 
     # ── 无放回顺序 + DDP 分片（与串行相同的机制）──────────────────────────
     probe = env_factory()
@@ -568,24 +558,21 @@ def _run_eval_batched(
             if not active:
                 break
 
-            # ── 批量构造 prompt / embedding / soft prefix ──────────────────
+            # ── 批量构造 prompt / state_text / skill_text ──────────────────
+            # exp4: encoder 直接吃原始文本（与 training/rollout.py 的
+            # state_text 格式一致），不再预先算 embedding。
             prompts: List[str] = []
-            emb_list = []   # (state_emb [1,D], skill_emb [1,D])
+            state_texts: List[str] = []
+            skill_texts: List[str] = []
             for st in active:
                 skill = skill_lib.retrieve_for_encoder(
                     st.info["task_description"], task_type=st.info.get("task_type")
                 )
                 skill_text = skill.grounding_text
-                skill_emb = skill_emb_cache.get(skill_text)
-                if skill_emb is None:
-                    skill_emb = get_text_embedding(skill_text, model, tokenizer, device)
-                    if skill_emb.dim() == 1:
-                        skill_emb = skill_emb.unsqueeze(0)
-                    skill_emb_cache[skill_text] = skill_emb
-                state_emb = get_text_embedding(st.obs, model, tokenizer, device)
-                if state_emb.dim() == 1:
-                    state_emb = state_emb.unsqueeze(0)
-                emb_list.append((state_emb, skill_emb))
+                skill_texts.append(skill_text)
+                state_texts.append(
+                    f"Task: {st.info['task_description']}\nObservation: {st.obs}"
+                )
                 prompts.append(_build_eval_prompt(
                     st.obs, st.info, st.history, st.steps + 1, skill_lib, skill_text
                 ))
@@ -603,9 +590,7 @@ def _run_eval_batched(
             ).to(device)
 
             # ── 批量 encoder → projector → soft prefix ──────────────────────
-            state_embs = torch.cat([e[0] for e in emb_list], dim=0)   # [n, D]
-            skill_embs = torch.cat([e[1] for e in emb_list], dim=0)   # [n, D]
-            mu, log_var = encoder(state_embs, skill_embs)
+            mu, log_var, _pooled_state = encoder(state_texts, skill_texts)
             z_tilde = sample_z(mu, log_var)                            # [n, L]
             soft_prefix = projector(z_tilde)                           # [n, m, H]
 

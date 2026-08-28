@@ -68,7 +68,7 @@ def main():
 
     # ── 模型 + fast modules + skill library + trainer（复用 train.py 的构建）──
     model, tokenizer = train_main.build_model_and_tokenizer(cfg, device, is_ddp=False)
-    encoder, prior_net, projector, reward_predictor, grounding_decoder = \
+    encoder, prior_net, projector, reward_predictor, grounding_decoder, shared_t5 = \
         train_main.build_fast_modules(cfg, device)
 
     from skill_library.library import SkillLibrary
@@ -83,12 +83,13 @@ def main():
     )
     skill_updater = SkillUpdater(model=model, tokenizer=tokenizer, device=device)
     aux_modules = [encoder, prior_net, projector, reward_predictor, grounding_decoder]
-    optimizer = train_main.build_optimizer(model, aux_modules, cfg)
+    optimizer = train_main.build_optimizer(model, aux_modules, cfg, shared_t5=shared_t5)
 
     trainer = InfoskillTrainer(
         model=model, tokenizer=tokenizer,
         encoder=encoder, prior_net=prior_net, projector=projector,
         reward_predictor=reward_predictor, grounding_decoder=grounding_decoder,
+        shared_t5=shared_t5,
         skill_lib=skill_lib, skill_updater=skill_updater, optimizer=optimizer,
         device=device, cfg=cfg, is_ddp=False, rank=0, world_size=1,
     )
@@ -170,16 +171,18 @@ def main():
         n_records += B
 
         # 与 _fast_update 一致：encoder → z → projector → LLM log_prob 全带梯度
-        state_embs_b = torch.stack([r.state_emb for r in batch_records], dim=0).to(device)
-        skill_embs_b = torch.stack([r.skill_emb for r in batch_records], dim=0).to(device)
-        mu_new, log_var_new = trainer.encoder(state_embs_b, skill_embs_b)
+        # exp4: encoder 直接吃存储的原始文本，返回 (mu, log_var, pooled_state)；
+        # pooled_state 取代旧的 state_embs_b，供 prior_net/reward_predictor 使用。
+        state_texts_b = [r.state_text for r in batch_records]
+        skill_texts_b = [r.skill_text for r in batch_records]
+        mu_new, log_var_new, pooled_state_b = trainer.encoder(state_texts_b, skill_texts_b)
         eps_b = torch.stack([r.eps for r in batch_records], dim=0).to(device)
         std_new = torch.exp(0.5 * log_var_new)
         z_tilde_new = mu_new + std_new * eps_b
         soft_prefix_b = trainer.projector(z_tilde_new)
         log_probs_b = trainer._recompute_log_probs_batch(batch_records, soft_prefix_b)
-        prior_mu_b, prior_logvar_b = trainer.prior_net(state_embs_b)
-        pred_adv_b = trainer.reward_predictor(z_tilde_new, state_embs_b)
+        prior_mu_b, prior_logvar_b = trainer.prior_net(pooled_state_b)
+        pred_adv_b = trainer.reward_predictor(z_tilde_new, pooled_state_b)
         adv_b = torch.tensor(
             [adv_per_ep[r.ep_idx] for r in batch_records],
             device=device, dtype=torch.float32,
