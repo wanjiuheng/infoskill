@@ -24,16 +24,18 @@ fast:
   num_prefix: 8               # m: number of soft prefix tokens
   grounding_hidden_dim: 512   # GroundingDecoder LSTM hidden size
   grounding_max_len: 64       # max tokens for grounding target (title + principle)
+  # exp4 固定用 T5GroundingDecoder，不 consult decoder_type（见 train.py 的
+  # build_fast_modules）。显式写 t5_backbone 为训练机本地路径——不写的话会
+  # 落到代码里硬编码的默认值 "google/t5-efficient-tiny"（HF Hub 仓库名，
+  # 需要联网下载），训练机可能没有到 huggingface.co 的网络，会在这一步失败。
+  t5_backbone: "/models/wanjh2/models/google/t5-efficient-tiny"
+  t5_max_length: 256
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
   alpha_fidelity: 0.1          # weight for fidelity loss
   alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta）
   alpha2: 0.01                 # weight for grounding loss
-
-# exp4 固定用 T5GroundingDecoder，不consult decoder_type（见 train.py 的
-# build_fast_modules）；t5_backbone 沿用 configs/alfworld.yaml 的默认值
-# google/t5-efficient-tiny（未在此显式覆盖）。
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:

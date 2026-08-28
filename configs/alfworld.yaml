@@ -29,7 +29,8 @@ fast:
   # exp4: 热启动 Encoder/GroundingDecoder 用的预训练模型（真实 C4 语料预训练
   # 过，不是随机初始化；~15.6M 参数，量级对齐 tinybert）。encoder 和 decoder
   # 共享同一个实例（weight tying，见 train.py 的 build_fast_modules）。
-  t5_backbone: "google/t5-efficient-tiny"
+  # 训练机上本地路径（不走 HF Hub 下载，与 model.backbone 一致的本地模型习惯）。
+  t5_backbone: "/models/wanjh2/models/google/t5-efficient-tiny"
   t5_max_length: 256          # state_text/skill_text 的 T5 tokenize 上限
                                 # （沿用旧 Qwen mean-pool 的默认值；新增截断
                                 # 监控，见 models/encoder_t5.py TruncationMonitor）
