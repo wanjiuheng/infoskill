@@ -14,7 +14,7 @@ Usage:
 
 The script:
   1. Loads config from YAML.
-  2. Loads Qwen2.5-7B-Instruct with LoRA applied.
+  2. Loads Qwen3-1.7B full-parameter (no LoRA).
   3. Instantiates all Fast Module components + SkillLibrary + SkillUpdater.
   4. Creates env factories for train and eval.
   5. Builds a single AdamW optimiser over all trainable params.
@@ -31,7 +31,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
-from peft import LoraConfig, get_peft_model
 
 logger = logging.getLogger("train")
 
@@ -160,7 +159,7 @@ def cleanup_ddp(is_ddp: bool):
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = False):
-    """Load Qwen2.5-7B-Instruct (text-only), freeze backbone, apply LoRA."""
+    """Load Qwen3-1.7B (text-only), full-parameter training (no LoRA)."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = cfg["model"]["backbone"]
@@ -189,42 +188,22 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
             trust_remote_code=True,
         )
 
-    # Freeze backbone
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Apply LoRA
-    lora_cfg = cfg["model"]["lora"]
-    lora_config = LoraConfig(
-        r=lora_cfg["r"],
-        lora_alpha=lora_cfg["lora_alpha"],
-        target_modules=lora_cfg["target_modules"],
-        lora_dropout=lora_cfg.get("lora_dropout", 0.05),
-        bias=lora_cfg.get("bias", "none"),
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    # exp8：全参训练。不 freeze、不套 LoRA，所有参数保持 from_pretrained 默认的
+    # requires_grad=True（build_optimizer 会遍历所有可训练参数）。
 
     # DDP 模式下不包 DistributedDataParallel。观察证实（run 20260824, torch 2.6）
     # no_sync() 无法抑制每个 mini-batch backward 触发的梯度 allreduce，而各 rank
     # 的 active records 数 N 不同 → backward 次数不同，两 rank 的 collective 序
     # 永久错位，NCCL 必然死锁。改为完全手动同步：初始权重由 train.py main()
-    # 从 rank0 广播；_fast_update() 循环后对 LoRA 梯度手动 all_reduce 一次
+    # 从 rank0 广播；_fast_update() 循环后对可训练参数梯度手动 all_reduce 一次
     # （trainer.py 第 5 步），collective 数与 N / mini-batch 数彻底无关。
     if not is_ddp:
         model = model.to(device)
 
-    # Trade compute for memory: without this, the full-sequence forward pass in
-    # rollout._compute_log_probs() (needed to get a differentiable log-prob for
-    # the policy loss) keeps every layer's activations alive for backward and
-    # OOMs on a 7B model even at batch size 2. enable_input_require_grads() is
-    # required alongside it — with a frozen base model + inputs_embeds (not
-    # input_ids), gradient checkpointing otherwise can't recompute activations
-    # on the backward pass because the checkpointed input doesn't require grad.
-    base_model = model
-    base_model.gradient_checkpointing_enable()
-    base_model.enable_input_require_grads()
+    # exp8：关闭 gradient checkpointing。1.7B 全参在 80GB 单卡上显存宽裕（静态
+    # ~20.5GB，激活约为 7B 的 0.57 倍），无需用 20-30% 速度换显存（7B+LoRA 当年
+    # 开它是为了防 OOM）。全参下 embedding 本身可训练，inputs_embeds 自带梯度，
+    # 也不再需要 enable_input_require_grads()。
 
     return model, tokenizer
 
@@ -342,9 +321,9 @@ def make_eval_env_factory(cfg: dict):
 # ── Optimiser ─────────────────────────────────────────────────────────────────
 
 def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
-    """Single AdamW over LoRA params + all auxiliary modules."""
+    """Single AdamW over all trainable params + all auxiliary modules."""
     params = []
-    # LoRA params
+    # Backbone params（exp8 全参：所有可训练参数）
     for p in model.parameters():
         if p.requires_grad:
             params.append(p)
@@ -427,8 +406,8 @@ def main():
     encoder, prior_net, projector, reward_predictor, grounding_decoder = build_fast_modules(cfg, device)
 
     # DDP: 初始权重从 rank0 广播（不包 DDP 后没有构造期广播）。set_seed(seed+rank)
-    # 按 rank 播种 → LoRA 与 aux 模块每 rank 随机初始化不同；不同步则各 rank 从
-    # 不同起点训练，即使梯度 allreduce 后也永久保持初始偏移分叉。之前只有 LoRA
+    # 按 rank 播种 → backbone 与 aux 模块每 rank 随机初始化不同；不同步则各 rank
+    # 从不同起点训练，即使梯度 allreduce 后也永久保持初始偏移分叉。之前只有 LoRA
     # 被 DDP 构造器广播，aux 模块从未同步（潜在分叉 bug），这里一并修复。
     if is_ddp:
         for p in model.parameters():
@@ -438,7 +417,7 @@ def main():
             for p in m.parameters():
                 if p.requires_grad:
                     dist.broadcast(p.data, src=0)
-        logger.info("Broadcast initial trainable weights from rank 0 (LoRA + aux)")
+        logger.info("Broadcast initial trainable weights from rank 0 (backbone + aux)")
 
     # Build skill library - need to pass the base model (unwrapped)
     from skill_library.library import SkillLibrary

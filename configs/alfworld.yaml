@@ -9,14 +9,9 @@ paths:
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  backbone: "/models/wanjh2/models/Qwen/Qwen2.5-7B-Instruct"
-  hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
-  lora:
-    r: 16
-    lora_alpha: 32
-    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-    lora_dropout: 0.05
-    bias: "none"
+  backbone: "/root/autodl-tmp/wjh/models/Qwen/Qwen3-1.7B"
+  hidden_size: 2048           # Qwen3-1.7B hidden dim (also STATE_DIM / SKILL_DIM)
+  # exp8：全参训练，不再用 LoRA（无 lora 段）
 
 # ── Fast Module (Encoder / Projector / Predictors) ────────────────────────────
 fast:
@@ -27,9 +22,12 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1           # weight for fidelity loss
-  alpha_rate: 0.0               # exp3: 消融 rate loss（同 exp1）
-  alpha2: 0.01                  # weight for grounding loss
+  # exp8 直接套用 exp5 的配平系数（8.56/0.0363/0.0174）。注意：这些系数是在
+  # 7B+LoRA(T5 decoder) 结构上量梯度反推的，exp8 换 1.7B 全参后梯度范数不同，
+  # 属近似配平（用户确认：起码比原始系数好）。
+  alpha_fidelity: 8.56          # 原 0.1
+  alpha_rate: 0.0363            # 原 0.0（exp8 恢复 rate loss 并配平）
+  alpha2: 0.0174                # 原 0.01
 
 # ── Fast Module: GroundingDecoder 实现选择 ────────────────────────────────────
 # exp3: GroundingDecoder 从 LSTM 换成 2层 decoder-only transformer

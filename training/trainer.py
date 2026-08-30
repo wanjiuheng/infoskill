@@ -952,8 +952,9 @@ class InfoskillTrainer:
         # DDP 模式下用解包模型保存（DDP 对象没有 save_pretrained）
         model_to_save = self._base_model
 
-        # Save LoRA adapter weights
-        model_to_save.save_pretrained(os.path.join(path, "lora"))
+        # exp8 全参：保存完整模型权重（不再是 LoRA adapter）。1.7B bf16 ≈ 3.4GB，
+        # save_pretrained 默认 <5GB 单文件 model.safetensors。
+        model_to_save.save_pretrained(os.path.join(path, "model"))
 
         # Save auxiliary modules
         torch.save({
@@ -987,11 +988,11 @@ class InfoskillTrainer:
 
     def load_checkpoint(self, path: str) -> None:
         """Load from a previously saved checkpoint directory."""
-        # 恢复 LoRA：把 adapter 权重加载到现有模型对象（set_peft_model_state_dict
+        # 恢复全参模型权重：把 checkpoint 的完整权重加载到现有模型对象（load_state_dict
         # 保持参数对象不变，optimizer 持有的参数引用才继续有效）。不要用
-        # PeftModel.from_pretrained 重建模型——那会创建新参数对象，resume 后
-        # optimizer 更新的旧对象不再被 forward 使用，LoRA 权重将不再更新。
-        self._load_lora(path)
+        # from_pretrained 重建模型——那会创建新参数对象，resume 后 optimizer 更新的
+        # 旧对象不再被 forward 使用，权重将不再更新。
+        self._load_model_weights(path)
 
         # weights_only=False: this file is our own checkpoint (trusted) and
         # contains non-tensor state (usage_history is a defaultdict(deque)),
@@ -1052,28 +1053,30 @@ class InfoskillTrainer:
 
         logger.info("Loaded checkpoint from %s (episode %d)", path, self._episode_count)
 
-    def _load_lora(self, path: str) -> None:
-        """把 checkpoint 的 LoRA adapter 权重加载进现有模型，不重建模型对象。
+    def _load_model_weights(self, path: str) -> None:
+        """把 checkpoint 的完整模型权重加载进现有模型，不重建模型对象。
 
         保持 self._base_model 及其参数对象不变，这样 train.py 里基于该模型构建的
         optimizer 参数引用在 resume 后仍然有效（否则梯度更新落在无人使用的旧
-        参数对象上，LoRA 权重静默冻结）。
+        参数对象上，全参权重静默冻结）。
         """
-        from peft import set_peft_model_state_dict
-        lora_dir = os.path.join(path, "lora")
-        safetensors_path = os.path.join(lora_dir, "adapter_model.safetensors")
-        bin_path = os.path.join(lora_dir, "adapter_model.bin")
+        model_dir = os.path.join(path, "model")
+        safetensors_path = os.path.join(model_dir, "model.safetensors")
         if os.path.exists(safetensors_path):
+            # 单文件（1.7B bf16 ≈ 3.4GB < save_pretrained 默认分片阈值 5GB）
             from safetensors.torch import load_file
-            adapter_state = load_file(safetensors_path)
-        elif os.path.exists(bin_path):
-            adapter_state = torch.load(bin_path, map_location=self.device)
-            if "state_dict" in adapter_state:  # 兼容老格式（带 state_dict 包装）
-                adapter_state = adapter_state["state_dict"]
+            state_dict = load_file(safetensors_path)
+            self._base_model.load_state_dict(state_dict)
         else:
-            raise FileNotFoundError(f"No adapter weights found in {lora_dir}")
-        set_peft_model_state_dict(self._base_model, adapter_state)
-        logger.info("LoRA adapter loaded from %s", lora_dir)
+            # 分片 safetensors（模型更大或未来配置）：from_pretrained 读回完整权重
+            from transformers import AutoModelForCausalLM
+            loaded = AutoModelForCausalLM.from_pretrained(
+                model_dir, torch_dtype=torch.bfloat16, device_map="cpu",
+                trust_remote_code=True,
+            )
+            self._base_model.load_state_dict(loaded.state_dict())
+            del loaded
+        logger.info("Full model weights loaded from %s", model_dir)
 
     def _save_metrics_plot(self) -> None:
         """

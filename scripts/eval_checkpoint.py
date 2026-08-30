@@ -64,30 +64,26 @@ def main():
     cfg    = load_config(args.config)
     device = torch.device(cfg.get("device", "cuda"))
 
-    # ── Backbone + LoRA ───────────────────────────────────────────────────────
+    # ── Backbone（exp8 全参：直接从 checkpoint 加载完整模型权重） ──────────────
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
 
     model_name = cfg["model"]["backbone"]
-    logger.info("Loading backbone: %s", model_name)
+    logger.info("Loading backbone (tokenizer): %s", model_name)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+    # 全参 checkpoint：完整权重存在 checkpoint/<tag>/model/ 下
+    model_dir = os.path.join(args.checkpoint, "model")
+    logger.info("Loading full model weights: %s", model_dir)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",   # FA2：加速 eval 推理
         device_map="auto",
         trust_remote_code=True,
     )
-    for p in base_model.parameters():
-        p.requires_grad = False
-
-    lora_path = os.path.join(args.checkpoint, "lora")
-    logger.info("Loading LoRA adapter: %s", lora_path)
-    model = PeftModel.from_pretrained(base_model, lora_path)
     model.eval()
 
     # ── Fast modules (only Encoder + Projector needed for eval) ──────────────
