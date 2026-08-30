@@ -37,9 +37,13 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1          # weight for fidelity loss
-  alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta）
-  alpha2: 0.01                 # weight for grounding loss
+  # exp5 配平后系数：由 scripts/diagnose_grad_norms.py 在 ep800 checkpoint 上
+  # 量出四项对 encoder+projector 的未加权梯度范数（policy 11.81 / fidelity 0.460
+  # / rate 108.6 / grounding 226.5），再反推 alpha_i = (P/3)/‖∇L_i‖，P=11.81，
+  # 使三个 aux 对 encoder 的有效梯度各 = P/3 ≈ 3.94，policy:aux 从 5.22:1 → ≈1:1。
+  alpha_fidelity: 8.56         # 原 0.1（×85.6）
+  alpha_rate: 0.0363           # 原 0.0001（×363，原值形同虚设）
+  alpha2: 0.0174               # 原 0.01（×1.74）
 
 # exp4 不使用 decoder_type 开关（不走 lstm/transformer 分支）——
 # GroundingDecoder 固定用 T5GroundingDecoder，见 train.py 的 build_fast_modules。

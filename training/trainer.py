@@ -1179,6 +1179,54 @@ class InfoskillTrainer:
         plt.savefig(plot_path, dpi=100)
         plt.close(fig)
 
+        # exp5：额外输出一张"乘以系数后"的四项 loss 曲线图，直观展示配平后
+        # 各项在 total 里的实际贡献（fidelity/rate/grounding 各乘其 alpha 系数）。
+        self._save_weighted_loss_plot()
+
+    def _save_weighted_loss_plot(self) -> None:
+        """
+        保存"乘以系数后"的四项 loss 曲线图（weighted_loss_curve.png）。
+
+        与 loss_curve.png 里未加权的 Loss Components 不同，这里把 policy/fidelity/
+        rate/grounding 分别乘上实际生效的系数（policy 系数恒为 1.0，其余为
+        self.alpha_fidelity / self.alpha_rate / self.alpha2），所以曲线高度直接
+        反映该项对 total loss 的贡献量级。配平后三个 aux 应大体可比（梯度上各
+        约 = policy/3；数值上因各项"数值→梯度敏感度"不同，fidelity 会偏大）。
+        """
+        if not self._metrics_history:
+            return
+
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # 无 GUI 后端
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logger.warning("matplotlib 未安装，跳过绘图（pip install matplotlib）")
+            return
+
+        episodes = [m["episode"] for m in self._metrics_history]
+        p = [m["policy_loss"] * 1.0 for m in self._metrics_history]
+        f = [m["fidelity_loss"] * self.alpha_fidelity for m in self._metrics_history]
+        r = [m["rate_loss"] * self.alpha_rate for m in self._metrics_history]
+        g = [m["grounding_loss"] * self.alpha2 for m in self._metrics_history]
+        total = [a + b + c + d for a, b, c, d in zip(p, f, r, g)]
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(episodes, p, label="policy × 1.0", linewidth=1.2)
+        ax.plot(episodes, f, label=f"fidelity × {self.alpha_fidelity}", linewidth=1.2)
+        ax.plot(episodes, r, label=f"rate × {self.alpha_rate}", linewidth=1.2)
+        ax.plot(episodes, g, label=f"grounding × {self.alpha2}", linewidth=1.2)
+        ax.plot(episodes, total, label="total", color="tab:red", linewidth=1.5)
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Weighted Loss")
+        ax.set_title("Weighted Loss Components (after multiplying by coefficients)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        plt.tight_layout()
+        plot_path = os.path.join(self._run_log_dir, "weighted_loss_curve.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close(fig)
+
     def _save_eval_plot(self) -> None:
         """
         Save eval success rate curve to logs/eval_curve.png.
