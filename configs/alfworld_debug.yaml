@@ -22,16 +22,19 @@ model:
 fast:
   latent_dim: 64              # z_tilde dimension
   num_prefix: 8               # m: number of soft prefix tokens
-  grounding_hidden_dim: 512   # GroundingDecoder LSTM hidden size
+  grounding_hidden_dim: 512   # GroundingDecoder hidden size
   grounding_max_len: 64       # max tokens for grounding target (title + principle)
+  grounding_num_layers: 6     # exp6: GroundingDecoder(transformer) 层数 2→6
+  encoder_num_layers: 6       # exp6: encoder 2 层 MLP → 6 层（首尾骨架+中间4层512）
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1          # weight for fidelity loss（消融实验设为 0.0 即可去掉）
-  alpha_rate: 0.0001           # weight for rate/KL loss（= 旧 alpha1×beta）
-  alpha2: 0.01                 # weight for grounding loss
+  # 套用 exp5 配平系数（见 alfworld.yaml 注释；与正式配置一致）
+  alpha_fidelity: 8.56          # 原 0.1
+  alpha_rate: 0.0363            # 原 0.0001
+  alpha2: 0.0174                # 原 0.01
 
-decoder_type: "lstm"          # "lstm"（默认）| "transformer"（消融实验用）
+decoder_type: "transformer"   # exp6: 与正式配置一致，用 transformer decoder
 
 # ── GRPO / Rollout ────────────────────────────────────────────────────────────
 rollout:

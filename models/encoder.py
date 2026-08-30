@@ -16,14 +16,14 @@ PriorNetwork:
 
 import torch
 import torch.nn as nn
-from typing import Tuple
+from typing import List, Tuple
 
 
 class StateConditionalEncoder(nn.Module):
     """
     Compress (state, skill) → Gaussian latent distribution.
 
-    Architecture: Concat → LayerNorm → 2-layer MLP → (mu, log_var)
+    Architecture: Concat → LayerNorm → num_layers-layer MLP → (mu, log_var)
     Kept intentionally shallow — the LLM backbone does the heavy lifting;
     this module only needs to learn *what part* of the skill matters now.
     """
@@ -34,17 +34,20 @@ class StateConditionalEncoder(nn.Module):
         skill_dim: int,     # same as state_dim (same embedding source)
         latent_dim: int,    # z_tilde dimension, e.g. 64
         hidden_dim: int = 512,
+        num_layers: int = 2,   # MLP 层数：2 = 原版（首 in_dim→512、尾 512→256）；
+                                # 6 = 首尾骨架不变 + 中间塞 4 层 512→512（exp6）
     ) -> None:
         super().__init__()
         in_dim = state_dim + skill_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-        )
+        layers: List[nn.Module] = []
+        # 首层：in_dim → hidden_dim
+        layers += [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        # 中间层：hidden_dim → hidden_dim（共 num_layers - 2 层）
+        for _ in range(num_layers - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        # 尾层：hidden_dim → hidden_dim // 2
+        layers += [nn.Linear(hidden_dim, hidden_dim // 2), nn.LayerNorm(hidden_dim // 2), nn.GELU()]
+        self.net = nn.Sequential(*layers)
         self.fc_mu     = nn.Linear(hidden_dim // 2, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim // 2, latent_dim)
 

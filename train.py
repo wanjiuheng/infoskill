@@ -268,7 +268,8 @@ def build_fast_modules(cfg: dict, device: torch.device):
     vocab_size = len(tokenizer)
 
     encoder = StateConditionalEncoder(
-        state_dim=state_dim, skill_dim=skill_dim, latent_dim=latent_dim
+        state_dim=state_dim, skill_dim=skill_dim, latent_dim=latent_dim,
+        num_layers=cfg["fast"].get("encoder_num_layers", 2),
     ).to(device)
     prior_net = PriorNetwork(
         state_dim=state_dim, latent_dim=latent_dim
@@ -284,6 +285,7 @@ def build_fast_modules(cfg: dict, device: torch.device):
         state_dim=state_dim,
         vocab_size=vocab_size,
         hidden_dim=cfg["fast"]["grounding_hidden_dim"],
+        num_layers=cfg["fast"].get("grounding_num_layers", 2),
         max_len=cfg["fast"]["grounding_max_len"],
         pad_token_id=tokenizer.pad_token_id or 0,
     ).to(device)
