@@ -22,14 +22,19 @@ model:
 fast:
   latent_dim: 64              # z_tilde dimension
   num_prefix: 8               # m: number of soft prefix tokens
-  grounding_hidden_dim: 512   # GroundingDecoder LSTM hidden size
+  grounding_hidden_dim: 512   # GroundingDecoder hidden size
   grounding_max_len: 64       # max tokens for grounding target (title + principle)
+  grounding_num_layers: 6     # exp7: GroundingDecoder(transformer) 层数 2→6
+  encoder_num_layers: 2       # exp7: encoder 保持原 2 层 MLP 不变
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  alpha_fidelity: 0.1           # weight for fidelity loss
-  alpha_rate: 0.0               # exp3: 消融 rate loss（同 exp1）
-  alpha2: 0.01                  # weight for grounding loss
+  # exp6/exp7 直接套用 exp5 的配平系数（8.56/0.0363/0.0174）。注意：这些系数
+  # 是在 exp4(T5 decoder) 分支上量梯度反推得到的，与 exp6/exp7 的 transformer
+  # decoder 结构不完全一致，属近似配平（用户已确认选 B：直接套近似系数）。
+  alpha_fidelity: 8.56          # 原 0.1（exp5 配平值）
+  alpha_rate: 0.0363            # 原 0.0/0.0001（exp5 配平值）
+  alpha2: 0.0174                # 原 0.01（exp5 配平值）
 
 # ── Fast Module: GroundingDecoder 实现选择 ────────────────────────────────────
 # exp3: GroundingDecoder 从 LSTM 换成 2层 decoder-only transformer
