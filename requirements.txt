@@ -11,6 +11,10 @@
 transformers>=4.43.0        # Qwen2.5-7B-Instruct (text-only) support
 accelerate>=0.30.0
 peft>=0.11.0
+bitsandbytes>=0.45.0            # exp9: 8-bit Adam（7B 全参优化器状态降 4 倍）。
+                                # torch 2.6 需 >=0.45；直接 pip install bitsandbytes
+                                # （PyPI 有匹配 wheel，训练机 DNS 解析不了 github.com，
+                                #  不要走 github 源）。
 pyyaml
 numpy
 tqdm

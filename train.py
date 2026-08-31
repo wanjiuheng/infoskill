@@ -14,10 +14,10 @@ Usage:
 
 The script:
   1. Loads config from YAML.
-  2. Loads Qwen3-1.7B full-parameter (no LoRA).
+  2. Loads Qwen2.5-7B full-parameter (no LoRA).
   3. Instantiates all Fast Module components + SkillLibrary + SkillUpdater.
   4. Creates env factories for train and eval.
-  5. Builds a single AdamW optimiser over all trainable params.
+  5. Builds a single 8-bit AdamW optimiser over all trainable params.
   6. Runs InfoskillTrainer.train().
   7. Supports DDP (DistributedDataParallel) for multi-GPU training.
 """
@@ -159,7 +159,7 @@ def cleanup_ddp(is_ddp: bool):
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = False):
-    """Load Qwen3-1.7B (text-only), full-parameter training (no LoRA)."""
+    """Load Qwen2.5-7B (text-only), full-parameter training (no LoRA)."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = cfg["model"]["backbone"]
@@ -200,10 +200,11 @@ def build_model_and_tokenizer(cfg: dict, device: torch.device, is_ddp: bool = Fa
     if not is_ddp:
         model = model.to(device)
 
-    # exp8：关闭 gradient checkpointing。1.7B 全参在 80GB 单卡上显存宽裕（静态
-    # ~20.5GB，激活约为 7B 的 0.57 倍），无需用 20-30% 速度换显存（7B+LoRA 当年
-    # 开它是为了防 OOM）。全参下 embedding 本身可训练，inputs_embeds 自带梯度，
-    # 也不再需要 enable_input_require_grads()。
+    # exp9：重新开 gradient checkpointing。7B 全参（8bit Adam 后静态 ~47GB）的
+    # 激活仍是显存大头——exp6 观察证实 7B 不开梯度检查点 batch=2 都 OOM。全参下
+    # embedding 本身可训练，inputs_embeds 自带梯度，因此**不需要**
+    # enable_input_require_grads()（那是 LoRA 冻结 embedding 时才需要的）。
+    model.gradient_checkpointing_enable()
 
     return model, tokenizer
 
@@ -321,9 +322,11 @@ def make_eval_env_factory(cfg: dict):
 # ── Optimiser ─────────────────────────────────────────────────────────────────
 
 def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
-    """Single AdamW over all trainable params + all auxiliary modules."""
+    """Single 8-bit AdamW (bitsandbytes) over all trainable params + aux modules."""
+    import bitsandbytes as bnb
+
     params = []
-    # Backbone params（exp8 全参：所有可训练参数）
+    # Backbone params（exp9 全参：所有可训练参数）
     for p in model.parameters():
         if p.requires_grad:
             params.append(p)
@@ -332,7 +335,10 @@ def build_optimizer(model, modules: list, cfg: dict) -> torch.optim.Optimizer:
         params.extend(m.parameters())
 
     lr = float(cfg["training"].get("learning_rate", 1e-4))
-    return torch.optim.AdamW(params, lr=lr)
+    # 8-bit Adam：优化器状态 fp32 → 8bit，静态显存从 ~91GB 降到 ~47GB，是 7B
+    # 全参能在 80GB 单卡（配合梯度检查点）跑起来的关键。要求 bnb>=0.41 以支持
+    # bf16 参数（state 内部反量化到 fp32 更新再量化回，参数本身仍保持 bf16）。
+    return bnb.optim.AdamW8bit(params, lr=lr)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

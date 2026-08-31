@@ -9,9 +9,9 @@ paths:
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  backbone: "/root/autodl-tmp/wjh/models/Qwen/Qwen3-1.7B"
-  hidden_size: 2048           # Qwen3-1.7B hidden dim (also STATE_DIM / SKILL_DIM)
-  # exp8：全参训练，不再用 LoRA（无 lora 段）
+  backbone: "/models/wanjh2/models/Qwen/Qwen2.5-7B-Instruct"
+  hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
+  # exp9：全参训练，不再用 LoRA（无 lora 段）
 
 # ── Fast Module (Encoder / Projector / Predictors) ────────────────────────────
 fast:

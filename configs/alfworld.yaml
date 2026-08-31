@@ -9,9 +9,9 @@ paths:
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 model:
-  backbone: "/root/autodl-tmp/wjh/models/Qwen/Qwen3-1.7B"
-  hidden_size: 2048           # Qwen3-1.7B hidden dim (also STATE_DIM / SKILL_DIM)
-  # exp8：全参训练，不再用 LoRA（无 lora 段）
+  backbone: "/models/wanjh2/models/Qwen/Qwen2.5-7B-Instruct"
+  hidden_size: 3584           # Qwen2.5-7B hidden dim (also STATE_DIM / SKILL_DIM)
+  # exp9：全参训练，不再用 LoRA（无 lora 段）
 
 # ── Fast Module (Encoder / Projector / Predictors) ────────────────────────────
 fast:
@@ -22,8 +22,8 @@ fast:
 
 # ── Loss weights (paper eq. 8) ────────────────────────────────────────────────
 loss:
-  # exp8 直接套用 exp5 的配平系数（8.56/0.0363/0.0174）。注意：这些系数是在
-  # 7B+LoRA(T5 decoder) 结构上量梯度反推的，exp8 换 1.7B 全参后梯度范数不同，
+  # exp9 沿用 exp5 的配平系数（8.56/0.0363/0.0174）。这些系数是在 7B+LoRA(T5
+  # decoder) 结构上量梯度反推的；exp9 换 7B 全参后梯度范数不同（全参 vs LoRA），
   # 属近似配平（用户确认：起码比原始系数好）。
   alpha_fidelity: 8.56          # 原 0.1
   alpha_rate: 0.0363            # 原 0.0（exp8 恢复 rate loss 并配平）
