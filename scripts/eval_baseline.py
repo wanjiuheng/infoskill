@@ -127,7 +127,7 @@ def main():
     from eval.evaluate import EVAL_ORDER_SEED, _aggregate_eval_metrics, _build_eval_prompt
     from envs.alfworld_env import AlfworldTextEnv
     from utils.action_parser import match_admissible, parse_action
-    from utils.stopping_criteria import build_action_stop_criteria
+    from transformers import StoppingCriteria, StoppingCriteriaList
 
     rcfg = cfg.get("rollout", {})
     max_steps      = rcfg.get("max_steps", 50)
@@ -139,6 +139,29 @@ def main():
     # 串行/并行开关：serial 强制单局（日志不交错、好跟输入输出），
     # batch 用 --eval-batch-size 控制并行度（更快、日志交错）
     eval_batch_size = 1 if args.mode == "serial" else args.eval_batch_size
+
+    class _StopAtActionEndBaseline(StoppingCriteria):
+        """baseline 专用停止条件：只检查生成部分（prompt_len 之后）是否出现
+        </action>。InfoSkill 正式 eval 走 inputs_embeds 路径不受影响；baseline
+        走 input_ids 路径，criteria 收到的是完整序列（prompt+生成），而
+        _STEP_PROMPT 尾部含字面 </action>，会立即误触停止。"""
+
+        def __init__(self, tokenizer, prompt_len):
+            super().__init__()
+            self.tokenizer = tokenizer
+            self.stop_str = "</action>"
+            self.window = 32
+            self.prompt_len = prompt_len
+
+        def __call__(self, input_ids, scores, **kwargs):
+            gen = input_ids[:, self.prompt_len:]          # 只看生成部分
+            recent = gen[:, -self.window:]
+            for row in recent:
+                if self.stop_str not in self.tokenizer.decode(
+                    row, skip_special_tokens=True
+                ):
+                    return False
+            return True
 
     config_path = cfg["paths"]["alfworld_config"]
     env_seed_counter = {"count": 0}
@@ -234,16 +257,21 @@ def main():
             ).to(device)
 
             # ── 直接 input_ids 生成（无 soft prefix） ───────────────────────
+            # stopping criteria 必须只看生成部分（prompt_len 之后）：input_ids
+            # 路径下 generate 传给 criteria 的是完整序列，而 _STEP_PROMPT 尾部
+            # 含字面 </action>，会立即误触停止（模型刚生成 <th 就被掐断）。
+            prompt_len = enc.input_ids.shape[1]
             output_ids = model.generate(
                 input_ids=enc.input_ids,
                 attention_mask=enc.attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,            # greedy decoding（与正式 eval 一致）
                 pad_token_id=tokenizer.eos_token_id,
-                stopping_criteria=build_action_stop_criteria(tokenizer),
+                stopping_criteria=StoppingCriteriaList(
+                    [_StopAtActionEndBaseline(tokenizer, prompt_len)]
+                ),
             )
             # input_ids 路径返回完整序列 [n, prompt_len + gen_len]，截掉 prompt
-            prompt_len = enc.input_ids.shape[1]
 
             # ── 逐条 parse / step / 记录 ─────────────────────────────────────
             for j, st in enumerate(active):
