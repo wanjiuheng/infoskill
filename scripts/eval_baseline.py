@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -72,7 +73,10 @@ def main():
     parser = argparse.ArgumentParser(description="exp10: 7B 原始模型 baseline 评估（无 InfoSkill 模块）")
     parser.add_argument("--config", required=True, help="Path to YAML config")
     parser.add_argument("--n_episodes", type=int, default=140, help="Number of eval episodes (default: 140, full eval_in_distribution)")
-    parser.add_argument("--eval-batch-size", type=int, default=4, help="并行评估的 episode 数（滑动窗口，默认 4）")
+    parser.add_argument("--mode", choices=["serial", "batch"], default="batch",
+                        help="serial=逐局串行（日志每局完整不交错，便于跟输入输出）；"
+                             "batch=多局并行（更快，日志交错）。")
+    parser.add_argument("--eval-batch-size", type=int, default=4, help="batch 模式下的并行 episode 数（滑动窗口）")
     parser.add_argument("--log-file", default=None, help="Path to log file (auto-generated if not set)")
     args = parser.parse_args()
 
@@ -132,7 +136,9 @@ def main():
     history_len    = rcfg.get("history_len", 3)
 
     n_episodes   = args.n_episodes
-    eval_batch_size = args.eval_batch_size
+    # 串行/并行开关：serial 强制单局（日志不交错、好跟输入输出），
+    # batch 用 --eval-batch-size 控制并行度（更快、日志交错）
+    eval_batch_size = 1 if args.mode == "serial" else args.eval_batch_size
 
     config_path = cfg["paths"]["alfworld_config"]
     env_seed_counter = {"count": 0}
@@ -188,6 +194,7 @@ def main():
     results: dict = defaultdict(list)
     per_episode: list = []
     n_done = 0
+    eval_start = time.time()
     pbar = tqdm(total=n_slice, desc="Eval", unit="ep", dynamic_ncols=True)
 
     with torch.no_grad():
@@ -249,8 +256,12 @@ def main():
                 st.steps += 1
                 ep_label = st.ep_idx + 1
 
+                # 大模型输入（prompt）+ 输出（raw_output）完整打印，便于调试
                 logger.info(
-                    "  ep=%d step=%d | raw_output: %s", ep_label, st.steps, raw_output[:200]
+                    "  ep=%d step=%d | PROMPT:\n%s", ep_label, st.steps, prompts[j]
+                )
+                logger.info(
+                    "  ep=%d step=%d | raw_output: %s", ep_label, st.steps, raw_output
                 )
                 logger.info(
                     "  ep=%d step=%d | parsed_action: %s | matched: %s",
@@ -282,6 +293,13 @@ def main():
                     per_episode.append(st.ep_record)
                     n_done += 1
                     pbar.update(1)
+                    elapsed_total = time.time() - eval_start
+                    running_sr = sum(sum(v) for v in results.values()) / n_done
+                    eta = elapsed_total / n_done * (n_slice - n_done)
+                    logger.info(
+                        "  [progress] done=%d/%d  running_sr=%.2f  elapsed=%.0fs  eta=%.0fs",
+                        n_done, n_slice, running_sr, elapsed_total, eta,
+                    )
                     logger.info(
                         "=== Episode %d/%d DONE === won=%s steps=%d reward=%.2f\n",
                         ep_label, n_episodes, st.won, st.steps, reward,
